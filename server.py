@@ -471,7 +471,8 @@ def save_state(hourly: Dict[str, Dict[str, int]], keep_hours: int = 72) -> None:
         for h, counts in hourly.items():
             agg[h].update(counts)
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=keep_hours)).isoformat()
-        pruned = {h: dict(c) for h, c in agg.items() if h >= cutoff}
+        pruned = {h: {c: n for c, n in dict(counts).items() if not is_noise_coin(c)}
+                  for h, counts in agg.items() if h >= cutoff}
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump({"hourly": pruned, "updated": datetime.now(timezone.utc).isoformat()}, f)
     except Exception:
@@ -486,6 +487,21 @@ NOISE_COINS = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "USDE", "T", "MU", "NVDA"
                # tokens de acciones apalancadas/fraccionadas (sufijo B): ruido para spot momentum
                "SPCXB", "AAPLB", "NVDAB", "GOOGLB", "CRCLB", "MRNAB", "QQQB", "SPYB", "TSLAB",
                "QQQ", "SPX", "SPY"}
+
+STOCK_ROOTS = {"META", "MSFT", "NVDA", "AAPL", "TSLA", "GOOGL", "AMD", "INTC", "BABA",
+               "PDD", "AMZN", "TSM", "AVGO", "NFLX", "COIN", "HOOD", "DELL", "ARM", "MU",
+               "SPX", "SPY", "QQQ", "CRCL", "MRNA", "SQ", "PLTR", "GME", "AMC", "UBER",
+               "SHOP", "DIS", "PYPL", "ABNB", "QCOM", "TXN", "AMAT", "LRCX", "MSTR",
+               "APPLOVIN", "TEM", "RGTI", "ASTS", "LUNR", "RKLB", "IONQ", "SERV",
+               "NBIS", "OKLO", "SMCI", "DJT", "N225", "HSI", "SX5E"}
+
+def is_noise_coin(code: str) -> bool:
+    """Acciones/tokenizados (META, MSFTB=AAPL+B...): raíz bursátil + sufijo B."""
+    if code in NOISE_COINS or code in STOCK_ROOTS:
+        return True
+    if len(code) > 2 and code.endswith("B") and code[:-1] in STOCK_ROOTS:
+        return True
+    return False
 
 def extract_coins_from_post(text: str, hashtags: List[str], trading_pairs: List[Dict]) -> List[str]:
     """Extrae códigos de moneda de un post: tradingPairsV2.code + $CASHTAG + #hashtag."""
@@ -506,7 +522,7 @@ def extract_coins_from_post(text: str, hashtags: List[str], trading_pairs: List[
         c = re.sub(r"^\d+", "", normalize_text(str(h)).lstrip("#$").upper())
         if 2 <= len(c) <= 12 and c not in STOP_COINS and re.fullmatch(r"[A-Z0-9]+", c or ""):
             found.add(c)
-    return sorted(found)
+    return sorted(c for c in found if not is_noise_coin(c))
 
 def get_24h_change(symbol_usdt: str, session: requests.Session) -> Dict[str, Any]:
     """Precio + cambio 24h vía API pública de Binance (sin key)."""
@@ -562,6 +578,7 @@ def top_rumor_discovery(
     short_start = now - timedelta(minutes=short_window_minutes)
 
     current_hourly = defaultdict(Counter)
+    coin_events = defaultdict(list)  # coin -> [(dt, bull_hits, bear_hits, views)]
     for p in posts:
         dt = p.get("datetime")
         if not dt or dt < baseline_start:
@@ -570,8 +587,13 @@ def top_rumor_discovery(
         if not coins:
             continue
         hk = dt.replace(minute=0, second=0, microsecond=0).isoformat()
+        tl = (p.get("text", "") or "").lower()
+        bh = sum(1 for w in BULL_WORDS if w in tl)
+        rh = sum(1 for w in BEAR_WORDS if w in tl)
+        vw = p.get("viewCount", 0) or 0
         for c in coins:
             current_hourly[hk][c] += 1
+            coin_events[c].append((dt, bh, rh, vw))
 
     # fusionar baseline persistente (corridas anteriores) para detectar MÁS TEMPRANO
     persistent_note = "solo-fetch"
@@ -638,7 +660,7 @@ def top_rumor_discovery(
     for coin, total in totals.items():
         if total < min_total_mentions:
             continue
-        if exclude_noise and coin in NOISE_COINS:
+        if exclude_noise and is_noise_coin(coin):
             continue
         # serie horaria excluyendo la ventana actual (aprox: excluir última hora si spike<=60, si no prorratear)
         series = []
@@ -727,6 +749,25 @@ def top_rumor_discovery(
         item["early_z"] = round(early_z, 2)
         item["is_early_burst"] = bool(early_z >= 2.0 and early >= 2)
         item["early_examples"] = coin_posts_short.get(coin, [])[:2]
+        # ACELERACIÓN DE SENTIMIENTO + VIEWS (lado salida: ¿llega la multitud?)
+        evs = coin_events.get(coin, [])
+        b_early = sum(b for d, b, r, v in evs if d >= short_start)
+        r_early = sum(r for d, b, r, v in evs if d >= short_start)
+        b_win = sum(b for d, b, r, v in evs if d >= spike_start)
+        r_win = sum(r for d, b, r, v in evs if d >= spike_start)
+        v_early = sum(v for d, b, r, v in evs if d >= short_start)
+        v_win = sum(v for d, b, r, v in evs if d >= spike_start)
+        win_h = max(window_h, 0.5)
+        v_rate = (v_early / (short_window_minutes / 60.0)) / max(v_win / win_h, 1)
+        item["bull_early"] = b_early
+        item["bear_early"] = r_early
+        item["net_early"] = b_early - r_early
+        item["bull_window"] = b_win
+        item["bear_window"] = r_win
+        item["views_velocity"] = round(v_rate, 2)
+        item["is_crowd_arriving"] = bool(v_rate >= 3.0 and recent >= 3)
+        item["sentiment_accel"] = ("BULL" if (b_early - r_early) >= 2 else
+                                   ("BEAR" if (r_early - b_early) >= 2 else "MIXED"))
         ranked.append(item)
 
     if tradeable_only:
