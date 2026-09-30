@@ -748,5 +748,113 @@ def top_rumor_discovery(
                  "Si el top ya está lleno de posts con mismos niveles = techo de atención, NO entrar (regla BE)."),
     }
 
+LEVEL_RE = re.compile(r"(entry|entries|tp\d?|target|targets|sl|stop[\s-]?loss|stop|support|resistance)\W{0,12}(\d+(?:\.\d+)?)", re.I)
+NUM_RE = re.compile(r"\$?\b(\d+(?:\.\d+)?)\b")
+EUPHORIA = ["take profit", "taking profit", "explode", "explod", "moon", "parabolic",
+            "fomo", "don't miss", "last chance", "100x", "to the moon", "llegó la hora"]
+
+@mcp.tool()
+def check_saturation(
+    coin: str,
+    window_minutes: int = 120,
+    max_pages: int = 15,
+) -> dict:
+    """
+    ¿El trade ya es de la multitud? Detecta SATURACIÓN de un coin en Square:
+    muchas menciones + mismos niveles repetidos (entrada/TP/SL) + euforia.
+
+    REGLA BE/ETHFI: si está saturado AL ENTRAR → descartar (techo de atención).
+    Si se satura DESPUÉS estando en profit → salir aunque no toque TP.
+
+    Args:
+        coin: Moneda (ej: BE, ADA, HYPE).
+        window_minutes: Ventana a revisar (default 120).
+        max_pages: Páginas de Square (default 15).
+
+    Returns:
+        count, autores únicos, views, cluster de niveles repetidos,
+        frases de euforia, veredicto (quiet/warming/saturated) y recomendación.
+    """
+    coin_u = coin.strip().upper().lstrip("$#")
+    posts = fetch_square_posts(max_pages=max_pages)
+    if not posts:
+        return {"error": "Square no devolvió posts. Reintenta."}
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(minutes=window_minutes)
+    hits = []
+    for p in posts:
+        dt = p.get("datetime")
+        if not dt or dt < start:
+            continue
+        text = p.get("text", "")
+        if contains_coin(text, p.get("hashtags", []), coin_u):
+            hits.append({"text": text, "time": dt.isoformat(),
+                         "views": p.get("viewCount", 0)})
+
+    # niveles mencionados (entry/tp/sl/support/...) y clustering al 1%
+    levels = []
+    for h in hits:
+        for m in LEVEL_RE.findall(h["text"]):
+            try:
+                levels.append(float(m[1]))
+            except ValueError:
+                pass
+    levels = [x for x in levels if x > 0]
+    levels.sort()
+    clusters: List[List[float]] = []
+    for lv in levels:
+        placed = False
+        for cl in clusters:
+            if abs(lv - cl[0]) / cl[0] <= 0.01:
+                cl.append(lv)
+                placed = True
+                break
+        if not placed:
+            clusters.append([lv])
+    biggest = max((len(c) for c in clusters), default=0)
+    rep_level = None
+    if biggest >= 2:
+        for cl in clusters:
+            if len(cl) == biggest:
+                rep_level = round(sum(cl) / len(cl), 4)
+                break
+
+    # euforia
+    euphoria_hits = []
+    for h in hits:
+        tl = h["text"].lower()
+        for e in EUPHORIA:
+            if e in tl:
+                euphoria_hits.append(e)
+                break
+
+    authors = len({h["text"][:60] for h in hits})  # aprox por inicio de texto
+    views_total = sum(h["views"] or 0 for h in hits)
+    n = len(hits)
+
+    if n >= 8 or biggest >= 4 or (len(euphoria_hits) >= 2 and n >= 5):
+        verdict, action = "SATURATED", ("NO ENTRAR (techo de atención). Si estás en profit: SALIR ya, no esperar TP.")
+    elif n >= 4 or biggest >= 3:
+        verdict, action = "WARMING", "Atención creciendo. Entrar solo con técnico TOP + precio en zona, SL estricto."
+    else:
+        verdict, action = "QUIET", "Sin multitud. Si hay spike técnico/rumor: entrada temprana válida."
+
+    return {
+        "coin": coin_u,
+        "window_minutes": window_minutes,
+        "mentions": n,
+        "approx_authors": authors,
+        "views_total": views_total,
+        "levels_found": len(levels),
+        "biggest_level_cluster": biggest,
+        "repeated_level": rep_level,
+        "euphoria_posts": len(euphoria_hits),
+        "euphoria_terms": sorted(set(euphoria_hits)),
+        "verdict": verdict,
+        "action": action,
+        "sample_posts": [{"text": h["text"][:200], "views": h["views"]} for h in hits[:3]],
+    }
+
 if __name__ == "__main__":
     mcp.run()
