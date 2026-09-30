@@ -102,7 +102,43 @@ def fetch_square_posts(max_pages: int = 25, page_size: int = 20) -> List[Dict[st
             # print(f"fetch error page {page}: {e}")
             break
 
-    # 2. News feed como complemento (primeras 5 páginas)
+    # 2. Trending (type=1) - lo caliente, detecta foco temprano
+    for page in range(1, 6):
+        try:
+            r = session.get(API_ARTICLE, params={"pageIndex": page, "pageSize": page_size, "type": 1}, timeout=12)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            lst = data.get("data", {}).get("vos") or data.get("data", {}).get("list") or []
+            if not lst:
+                break
+            new = 0
+            for p in lst:
+                pid = str(p.get("id") or "")
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                content = p.get("content") or ""
+                title = p.get("title") or ""
+                subtitle = p.get("subTitle") or ""
+                tps3 = p.get("tradingPairsV2") or p.get("tradingPairs") or []
+                posts.append({
+                    "id": pid,
+                    "text": f"{title} {subtitle} {content}".strip(),
+                    "hashtags": p.get("hashtagList") or [],
+                    "trading_pairs": tps3 if isinstance(tps3, list) else [],
+                    "timestamp": p.get("date") or 0,
+                    "viewCount": p.get("viewCount", 0),
+                    "likeCount": p.get("likeCount", 0),
+                })
+                new += 1
+            if new == 0:
+                break
+            time.sleep(0.5)
+        except Exception:
+            break
+
+    # 3. News feed como complemento (primeras 5 páginas)
     for page in range(1, 6):
         try:
             r = session.get(API_NEWS, params={"pageIndex": page, "pageSize": page_size}, timeout=12)
@@ -444,6 +480,9 @@ def save_state(hourly: Dict[str, Dict[str, int]], keep_hours: int = 72) -> None:
 CASHTAG_RE = re.compile(r"\$([A-Z]{2,12})\b")
 # tokens comunes que NO son monedas (evitan ruido)
 STOP_COINS = {"US", "USA", "ETF", "AI", "IT", "ON", "GO", "UP", "TV", "CEO", "ATM", "VIP", "NFT", "DEFI"}
+# stablecoins y acciones (ruido para trading de momentum: se excluyen con exclude_noise=True)
+NOISE_COINS = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "USDE", "T", "MU", "NVDA", "AAPL", "TSLA",
+               "GOOGL", "ARM", "DELL", "HOODB", "MSTR", "COIN", "AMD", "INTC", "META", "AMZN"}
 
 def extract_coins_from_post(text: str, hashtags: List[str], trading_pairs: List[Dict]) -> List[str]:
     """Extrae códigos de moneda de un post: tradingPairsV2.code + $CASHTAG + #hashtag."""
@@ -489,6 +528,8 @@ def top_rumor_discovery(
     with_price: bool = True,
     short_window_minutes: int = 30,
     use_persistent_baseline: bool = True,
+    tradeable_only: bool = True,
+    exclude_noise: bool = True,
 ) -> dict:
     """
     DESCUBRIMIENTO GENERAL: top de monedas con pico irregular de menciones en Square,
@@ -594,6 +635,8 @@ def top_rumor_discovery(
     for coin, total in totals.items():
         if total < min_total_mentions:
             continue
+        if exclude_noise and coin in NOISE_COINS:
+            continue
         # serie horaria excluyendo la ventana actual (aprox: excluir última hora si spike<=60, si no prorratear)
         series = []
         for h in hours_sorted:
@@ -652,10 +695,19 @@ def top_rumor_discovery(
                     item["chg_24h"] = px["chg_24h"]
                     item["quote_vol_24h"] = round(px["quote_vol"], 0)
                     break
-        # score ranking: z temporal + bonus transversal (log, cap 2) + momentum precio
+        # BONUS RUMOR: si los posts recientes traen keywords rumor = leading, no solo atención
+        rumor_hits = []
+        for ex in coin_posts_recent.get(coin, []):
+            tl = (ex.get("text") or "").lower()
+            for kw in DEFAULT_RUMOR_KEYWORDS:
+                if kw in tl and kw not in rumor_hits:
+                    rumor_hits.append(kw)
+        item["rumor_keywords"] = rumor_hits[:5]
+        rumor_bonus = min(len(rumor_hits) * 0.5, 1.5)
+        # score ranking: z temporal + bonus transversal (log, cap 2) + rumor + momentum precio
         mom = abs(item.get("chg_24h", 0))
         share_bonus = min(math.log1p(max(share_ratio - 1, 0)), 2.0) if recent >= 2 else 0.0
-        item["rank_score"] = round(z * (1 + min(mom, 20) / 20) + share_bonus, 2)
+        item["rank_score"] = round(z * (1 + min(mom, 20) / 20) + share_bonus + rumor_bonus, 2)
         item["examples"] = coin_posts_recent.get(coin, [])[:2]
         # DETECCIÓN TEMPRANA: aceleración en ventana corta (últimos short_window_minutes)
         early = 0
@@ -674,6 +726,9 @@ def top_rumor_discovery(
         item["early_examples"] = coin_posts_short.get(coin, [])[:2]
         ranked.append(item)
 
+    if tradeable_only:
+        # solo monedas con par USDT real en Binance (las demás son ruido/fragmentos)
+        ranked = [r for r in ranked if r.get("price") is not None]
     ranked.sort(key=lambda x: (x["rank_score"], x["recent_mentions"]), reverse=True)
     spikes = [r for r in ranked if r["is_spike"]]
     warming = [r for r in ranked if r["is_warming"]]
