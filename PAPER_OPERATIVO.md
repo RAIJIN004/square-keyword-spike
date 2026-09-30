@@ -13,6 +13,7 @@
 8. **EJECUCIÓN REAL (hedge):** `positionSide` obligatorio, 10x, notional ~10-19 USDT, TP/SL `closePosition=true` INMEDIATO. Errores: -4061 (falta positionSide), -4168 (no isolated en Multi-Assets), -4014 (tick size).
 9. **PROHIBIDO:** promediar, entrar saturado, chasear >+5%, más de 2 posiciones, riesgo >40% cuenta/trade. Balance <1.20 → parar.
 10. **VIGILANCIA:** cada 10-15 min Square de la posición. 5+ posts a favor = recta final → cerrar en market. Sentimiento volteado → cerrar ya.
+11. **ACELERACIÓN MANDA:** entrar solo con atención ACELERANDO (early burst 30m, posts creciendo). Salir cuando se ENFRÍA. **Nunca re-entrar en enfriamiento** aunque el top la muestre (NIGHT 30 sep: salida +0.125 en enfriamiento, re-entrada inválida cerrada a breakeven). El top dice *dónde mirar*, la aceleración dice *cuándo*.
 
 ## LOG DE OPERACIONES (real, USDT)
 | Fecha | Moneda | Lado | Entrada | Salida | PnL | Nota |
