@@ -856,5 +856,128 @@ def check_saturation(
         "sample_posts": [{"text": h["text"][:200], "views": h["views"]} for h in hits[:3]],
     }
 
+BULL_WORDS = ["longsetup", "long", "bullish", "bull", "breakout", "breaks resistance",
+               "accumulat", "reclaim", "upside", "demand zone", "bounce", "rebound",
+               "buying", "buyers", "higher", "target"]
+BEAR_WORDS = ["shortsetup", "short", "bearish", "bear", "breakdown", "breaks support",
+              "distribut", "rejection", "reject", "dump", "sell", "selling",
+              "sellers", "lower", "support break", "resistance reject"]
+
+@mcp.tool()
+def coin_signal(
+    coin: str,
+    window_minutes: int = 120,
+    max_pages: int = 12,
+) -> dict:
+    """
+    VEREDICTO ÚNICO por moneda: combina spike temprano + saturación + sentimiento + precio.
+    La lección ADA (SL -0.266 entrando saturado): sin este filtro NO se entra.
+
+    Returns:
+        verdict: ENTER_EARLY_LONG | ENTER_EARLY_SHORT | WAIT | AVOID_SATURATED,
+        con métricas y razones. Hermes obedece el veredicto sin reinterpretar.
+    """
+    coin_u = coin.strip().upper().lstrip("$#")
+    posts = fetch_square_posts(max_pages=max_pages)
+    if not posts:
+        return {"verdict": "WAIT", "reason": "Square sin datos", "coin": coin_u}
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(minutes=window_minutes)
+    short_start = now - timedelta(minutes=30)
+    hits = []
+    for p in posts:
+        dt = p.get("datetime")
+        if not dt or dt < start:
+            continue
+        text = p.get("text", "")
+        if contains_coin(text, p.get("hashtags", []), coin_u):
+            hits.append({"text": text, "dt": dt, "views": p.get("viewCount", 0)})
+
+    n = len(hits)
+    early = sum(1 for h in hits if h["dt"] >= short_start)
+
+    # baseline del estado persistente para el z temprano
+    st = load_state()
+    base_vals = []
+    for h, counts in st.get("hourly", {}).items():
+        try:
+            if datetime.fromisoformat(h) < short_start - timedelta(hours=1):
+                base_vals.append(counts.get(coin_u, 0))
+        except Exception:
+            pass
+    base_mean = statistics.mean(base_vals[-24:]) if base_vals else 0.5
+    early_expected = base_mean * 0.5
+    early_z = (early - early_expected) / math.sqrt(early_expected + 1)
+
+    # sentimiento bull/bear en los posts recientes
+    bull = bear = 0
+    for h in hits:
+        tl = h["text"].lower()
+        bull += sum(1 for w in BULL_WORDS if w in tl)
+        bear += sum(1 for w in BEAR_WORDS if w in tl)
+
+    # saturación: volumen + niveles repetidos + euforia
+    levels = []
+    for h in hits:
+        for m in LEVEL_RE.findall(h["text"]):
+            try:
+                levels.append(float(m[1]))
+            except ValueError:
+                pass
+    levels = sorted(x for x in levels if x > 0)
+    clusters: List[List[float]] = []
+    for lv in levels:
+        placed = False
+        for cl in clusters:
+            if abs(lv - cl[0]) / cl[0] <= 0.01:
+                cl.append(lv)
+                placed = True
+                break
+        if not placed:
+            clusters.append([lv])
+    biggest = max((len(c) for c in clusters), default=0)
+    euphoria = sum(1 for h in hits if any(e in h["text"].lower() for e in EUPHORIA))
+    saturated = n >= 8 or biggest >= 4 or (euphoria >= 2 and n >= 5)
+
+    # precio
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    px = get_24h_change(f"{coin_u}USDT", sess)
+    chg = px.get("chg_24h")
+
+    reasons = [
+        f"menciones {window_minutes}m: {n} (tempranas 30m: {early}, z={round(early_z,2)})",
+        f"sentimiento bull={bull} bear={bear}",
+        f"saturación: count={n} cluster_max={biggest} euforia={euphoria}",
+        f"precio 24h: {chg}%",
+    ]
+    if saturated:
+        verdict = "AVOID_SATURATED"
+        reasons.append("Ya es de la multitud (regla BE/ADA): NO entrar; en profit, salir.")
+    elif early >= 2 and early_z >= 1.5 and bull > bear and (chg is None or chg > -3):
+        verdict = "ENTER_EARLY_LONG"
+        reasons.append("Burst temprano + bulls dominan + precio no desplomado.")
+    elif early >= 2 and early_z >= 1.5 and bear > bull and (chg is None or chg < 3):
+        verdict = "ENTER_EARLY_SHORT"
+        reasons.append("Burst temprano + bears dominan + precio no volado.")
+    else:
+        verdict = "WAIT"
+        reasons.append("Sin burst temprano claro o sentimiento dividido.")
+
+    return {
+        "coin": coin_u,
+        "verdict": verdict,
+        "price": px.get("price"),
+        "chg_24h": chg,
+        "mentions": n,
+        "early_mentions_30m": early,
+        "early_z": round(early_z, 2),
+        "bull_hits": bull,
+        "bear_hits": bear,
+        "saturated": saturated,
+        "reasons": reasons,
+    }
+
 if __name__ == "__main__":
     mcp.run()
