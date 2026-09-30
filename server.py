@@ -511,6 +511,20 @@ def top_rumor_discovery(
     # última hora completa + fracción actual: usar ventana spike como tasa
     window_h = spike_window_minutes / 60.0
 
+    # Totales por hora (todas las monedas) para el SHARE TRANSVERSAL:
+    # ¿qué % de la conversación total se lleva cada moneda ahora vs su % normal?
+    total_per_hour = {h: sum(hourly[h].values()) for h in hours_sorted}
+    spike_hours = set()
+    for h in hours_sorted:
+        try:
+            if datetime.fromisoformat(h) >= spike_start - timedelta(hours=1):
+                spike_hours.add(h)
+        except Exception:
+            pass
+    total_recent_all = sum(total_per_hour[h] for h in spike_hours) or 1
+    total_base_all = sum(v for h, v in total_per_hour.items() if h not in spike_hours) or 1
+    n_base_hours = max(len([h for h in hours_sorted if h not in spike_hours]), 1)
+
     session = requests.Session()
     session.headers.update(HEADERS)
     ranked = []
@@ -549,6 +563,12 @@ def top_rumor_discovery(
         z = (recent - expected) / math.sqrt(expected + 1)
         # ratio velocidad
         ratio = recent / (expected + 0.5)
+        # SHARE TRANSVERSAL: % de la conversación total ahora vs % normal
+        base_coin = sum(hourly[h][coin] for h in hours_sorted if h not in spike_hours)
+        share_recent = (recent / total_recent_all) * 100
+        share_base = (base_coin / total_base_all) * 100
+        share_ratio = share_recent / max(share_base, 0.5)  # suelo 0.5% para no explotar con baseline 0
+        is_share_spike = bool(share_ratio >= 3.0 and recent >= 2)
 
         item = {
             "coin": coin,
@@ -558,8 +578,12 @@ def top_rumor_discovery(
             "baseline_per_hour": round(mean_h, 2),
             "z_poisson": round(z, 2),
             "velocity_ratio": round(ratio, 2),
+            "share_recent_pct": round(share_recent, 2),
+            "share_baseline_pct": round(share_base, 2),
+            "share_ratio": round(share_ratio, 2),
             "is_spike": bool(z >= 2.0 and recent > 0),
             "is_warming": bool(1.0 <= z < 2.0 and recent > 0),
+            "is_share_spike": is_share_spike,
         }
         if with_price:
             for suffix in ("USDT",):
@@ -569,9 +593,10 @@ def top_rumor_discovery(
                     item["chg_24h"] = px["chg_24h"]
                     item["quote_vol_24h"] = round(px["quote_vol"], 0)
                     break
-        # score ranking: z ponderado por momentum alineado (menciones+precio mismo signo sube)
+        # score ranking: z temporal + bonus transversal (log, cap 2) + momentum precio
         mom = abs(item.get("chg_24h", 0))
-        item["rank_score"] = round(z * (1 + min(mom, 20) / 20), 2)
+        share_bonus = min(math.log1p(max(share_ratio - 1, 0)), 2.0) if recent >= 2 else 0.0
+        item["rank_score"] = round(z * (1 + min(mom, 20) / 20) + share_bonus, 2)
         item["examples"] = coin_posts_recent.get(coin, [])[:2]
         ranked.append(item)
 
