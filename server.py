@@ -11,6 +11,7 @@ wxie0815-arch/binance-square-monitor:
 """
 import time
 import re
+import json
 import math
 import statistics
 from collections import defaultdict, Counter
@@ -411,6 +412,35 @@ def scan_all_rumors(
         "note": "z>=2 = pico irregular. corr% = qué % de menciones globales de esa keyword están atadas a esa moneda en la ventana."
     }
 
+import os as _os
+STATE_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "square_baseline.json")
+
+def load_state() -> Dict[str, Any]:
+    """Baseline persistente: conteos por moneda por hora de corridas anteriores."""
+    try:
+        if _os.path.exists(STATE_PATH):
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"hourly": {}}
+
+def save_state(hourly: Dict[str, Dict[str, int]], keep_hours: int = 72) -> None:
+    """Fusiona conteos actuales y poda a keep_hours."""
+    try:
+        st = load_state()
+        agg = defaultdict(Counter)
+        for h, counts in st.get("hourly", {}).items():
+            agg[h].update(counts)
+        for h, counts in hourly.items():
+            agg[h].update(counts)
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=keep_hours)).isoformat()
+        pruned = {h: dict(c) for h, c in agg.items() if h >= cutoff}
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"hourly": pruned, "updated": datetime.now(timezone.utc).isoformat()}, f)
+    except Exception:
+        pass
+
 CASHTAG_RE = re.compile(r"\$([A-Z]{2,12})\b")
 # tokens comunes que NO son monedas (evitan ruido)
 STOP_COINS = {"US", "USA", "ETF", "AI", "IT", "ON", "GO", "UP", "TV", "CEO", "ATM", "VIP", "NFT", "DEFI"}
@@ -457,6 +487,8 @@ def top_rumor_discovery(
     top_n: int = 10,
     min_total_mentions: int = 3,
     with_price: bool = True,
+    short_window_minutes: int = 30,
+    use_persistent_baseline: bool = True,
 ) -> dict:
     """
     DESCUBRIMIENTO GENERAL: top de monedas con pico irregular de menciones en Square,
@@ -479,33 +511,60 @@ def top_rumor_discovery(
     if not posts:
         return {"error": "Square no devolvió posts (API bloqueada o sin datos). Reintenta."}
 
+    # construir conteo horario del fetch actual
     now = datetime.now(timezone.utc)
     spike_start = now - timedelta(minutes=spike_window_minutes)
     baseline_start = now - timedelta(hours=baseline_hours)
+    short_start = now - timedelta(minutes=short_window_minutes)
 
-    # menciones por moneda por hora
-    hourly = defaultdict(lambda: Counter())
+    current_hourly = defaultdict(Counter)
+    for p in posts:
+        dt = p.get("datetime")
+        if not dt or dt < baseline_start:
+            continue
+        coins = extract_coins_from_post(p.get("text", ""), p.get("hashtags", []), p.get("trading_pairs", []))
+        if not coins:
+            continue
+        hk = dt.replace(minute=0, second=0, microsecond=0).isoformat()
+        for c in coins:
+            current_hourly[hk][c] += 1
+
+    # fusionar baseline persistente (corridas anteriores) para detectar MÁS TEMPRANO
+    persistent_note = "solo-fetch"
+    if use_persistent_baseline:
+        st = load_state()
+        for h, counts in st.get("hourly", {}).items():
+            if h >= baseline_start.isoformat() and h not in current_hourly:
+                current_hourly[h] = Counter(counts)
+            elif h >= baseline_start.isoformat():
+                for c, n in counts.items():
+                    current_hourly[h][c] = max(current_hourly[h][c], n)
+        save_state({h: dict(c) for h, c in current_hourly.items()})
+        persistent_note = "fetch+persistente(%d horas guardadas)" % len(st.get("hourly", {}))
+
+    # reutilizar conteo fusionado (fetch + persistente)
+    hourly = current_hourly
     coin_posts_recent = defaultdict(list)  # coin -> posts en ventana spike
+    coin_posts_short = defaultdict(list)  # coin -> posts en ventana corta (detección temprana)
 
     for p in posts:
         dt = p.get("datetime")
         if not dt or dt < baseline_start:
             continue
         text = p.get("text", "")
-        # trading pairs vienen en el raw? fetch normaliza; re-derivar de hashtags+texto
         coins = extract_coins_from_post(text, p.get("hashtags", []), p.get("trading_pairs", []))
-        if not coins:
-            continue
-        hk = dt.replace(minute=0, second=0, microsecond=0).isoformat()
         for c in coins:
-            hourly[hk][c] += 1
-            if dt >= spike_start:
-                if len(coin_posts_recent[c]) < 3:
-                    coin_posts_recent[c].append({
-                        "text": text[:220].replace("\n", " "),
-                        "time": dt.isoformat(),
-                        "views": p.get("viewCount"),
-                    })
+            if dt >= spike_start and len(coin_posts_recent[c]) < 3:
+                coin_posts_recent[c].append({
+                    "text": text[:220].replace("\n", " "),
+                    "time": dt.isoformat(),
+                    "views": p.get("viewCount"),
+                })
+            if dt >= short_start and len(coin_posts_short[c]) < 2:
+                coin_posts_short[c].append({
+                    "text": text[:180].replace("\n", " "),
+                    "time": dt.isoformat(),
+                })
 
     hours_sorted = sorted(hourly.keys())
     # última hora completa + fracción actual: usar ventana spike como tasa
@@ -598,17 +657,36 @@ def top_rumor_discovery(
         share_bonus = min(math.log1p(max(share_ratio - 1, 0)), 2.0) if recent >= 2 else 0.0
         item["rank_score"] = round(z * (1 + min(mom, 20) / 20) + share_bonus, 2)
         item["examples"] = coin_posts_recent.get(coin, [])[:2]
+        # DETECCIÓN TEMPRANA: aceleración en ventana corta (últimos short_window_minutes)
+        early = 0
+        for h in hours_sorted:
+            try:
+                hh = datetime.fromisoformat(h)
+            except Exception:
+                continue
+            if hh >= short_start - timedelta(hours=1):
+                early += hourly[h][coin]
+        early_expected = mean_h * (short_window_minutes / 60.0)
+        early_z = (early - early_expected) / math.sqrt(early_expected + 1)
+        item["early_mentions"] = early
+        item["early_z"] = round(early_z, 2)
+        item["is_early_burst"] = bool(early_z >= 2.0 and early >= 2)
+        item["early_examples"] = coin_posts_short.get(coin, [])[:2]
         ranked.append(item)
 
     ranked.sort(key=lambda x: (x["rank_score"], x["recent_mentions"]), reverse=True)
     spikes = [r for r in ranked if r["is_spike"]]
     warming = [r for r in ranked if r["is_warming"]]
+    early_list = [r for r in ranked if r.get("is_early_burst")]
     return {
         "posts_fetched": len(posts),
-        "window": f"{spike_window_minutes}m vs baseline {baseline_hours}h",
+        "baseline_mode": persistent_note,
+        "window": f"{spike_window_minutes}m vs baseline {baseline_hours}h + early {short_window_minutes}m",
         "coins_tracked": len(ranked),
         "spikes_detected": len(spikes),
         "warming_up": len(warming),
+        "early_bursts": [{"coin": r["coin"], "early_z": r["early_z"], "early_mentions": r["early_mentions"],
+                          "chg_24h": r.get("chg_24h"), "examples": r["early_examples"]} for r in early_list[:top_n]],
         "top": ranked[:top_n],
         "note": ("z_poisson>=2 = pico irregular (funciona con pocas menciones). "
                  "warming = acelerando (1-2). Cruza rank_score con chg_24h: spike + momentum = candidato Hermes. "
