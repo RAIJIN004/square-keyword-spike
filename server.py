@@ -768,6 +768,23 @@ def top_rumor_discovery(
         item["is_crowd_arriving"] = bool(v_rate >= 3.0 and recent >= 3)
         item["sentiment_accel"] = ("BULL" if (b_early - r_early) >= 2 else
                                    ("BEAR" if (r_early - b_early) >= 2 else "MIXED"))
+        # DIRECTIVA EXPLÍCITA para Hermes (no interpretar z-scores a mano):
+        chg_v = item.get("chg_24h")
+        net = item["net_early"]
+        if item["is_crowd_arriving"] or (recent >= 8 and (chg_v or 0) > 8):
+            directive, dreason = "AVOID", "multitud dentro / ya corrió: NO entrar; en profit, salir"
+        elif (item["is_early_burst"] or item["is_spike"]) and net >= 2 and (chg_v is None or chg_v < 5):
+            directive, dreason = "ENTER_EARLY_LONG", "burst + bulls acelerando + precio no volado"
+        elif (item["is_early_burst"] or item["is_spike"]) and net <= -2 and (chg_v is None or chg_v > -5):
+            directive, dreason = "ENTER_EARLY_SHORT", "burst + bears acelerando + precio no desplomado"
+        elif item["is_warming"] and net >= 2:
+            directive, dreason = "WATCH_BULL", "calentando bull: vigilar gatillo, aún no entrar"
+        elif item["is_warming"] and net <= -2:
+            directive, dreason = "WATCH_BEAR", "calentando bear: vigilar gatillo, aún no entrar"
+        else:
+            directive, dreason = "WAIT", "sin burst direccional claro"
+        item["directive"] = directive
+        item["directive_reason"] = dreason
         ranked.append(item)
 
     if tradeable_only:
