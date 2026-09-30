@@ -1,0 +1,158 @@
+"""AUTOTRADER Rumor Burst: monitorea, PITA en entrada, entra y sale solo.
+Sin IA: dirección = voto bull/bear por keywords + confirmación técnica rápida.
+Seguridad: 1 posición, notional ~10, cooldown 6h por moneda, stop diario -0.50 USDT,
+solo opera si balance > 1.20. DRY_RUN=True = solo pita y loguea.
+"""
+import sys, json, time
+import winsound
+sys.path.insert(0, r"C:\Users\jhonv\Downloads\square-keyword-spike")
+from server import top_rumor_discovery  # ANTES de añadir unified (ambos tienen server.py)
+sys.path.insert(0, r"C:\Users\jhonv\Downloads\trend-finder-unified")
+
+DRY_RUN = "--live" not in sys.argv
+NOTIONAL = 10.0
+MAX_POS = 1
+COOLDOWN_H = 6
+DAILY_STOP = -0.50
+STATE = r"C:\Users\jhonv\Downloads\square-keyword-spike\autotrader_state.json"
+
+from unified import flow_bias, book_bias
+from hourly_loop import signed, sync_clock, filters, rnd_step, BASE
+import requests
+
+def beep(kind):
+    try:
+        if kind == "entry":
+            winsound.Beep(880, 300); winsound.Beep(1200, 400)
+        elif kind == "exit_win":
+            winsound.Beep(1200, 200); winsound.Beep(1200, 200); winsound.Beep(1500, 400)
+        elif kind == "exit_loss":
+            winsound.Beep(400, 400); winsound.Beep(300, 500)
+    except Exception:
+        pass
+
+def log(m):
+    print(m, flush=True)
+
+def state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {"traded": {}, "day": "", "day_pnl": 0.0}
+
+def save_state(s):
+    json.dump(s, open(STATE, "w"))
+
+def positions():
+    acct = signed("GET", "/fapi/v2/account")
+    pos = [p for p in acct.get("positions", []) if abs(float(p.get("positionAmt", 0))) > 0]
+    return float(acct.get("availableBalance", 0)), pos
+
+def close_market(sym, amt, pos_side):
+    side = "SELL" if float(amt) > 0 else "BUY"
+    return signed("POST", "/fapi/v1/order", {"symbol": sym, "side": side, "type": "MARKET",
+                                             "quantity": abs(float(amt)), "positionSide": pos_side,
+                                             "reduceOnly": "true"})
+
+def run_once():
+    st = state()
+    today = time.strftime("%Y-%m-%d")
+    if st.get("day") != today:
+        st = {"traded": {}, "day": today, "day_pnl": 0.0}
+    if st["day_pnl"] <= DAILY_STOP:
+        log("stop diario alcanzado. No opera."); return st
+
+    avail, pos = positions()
+    log(f"balance disp={avail:.2f} abiertas={[p['symbol'] for p in pos]} modo={'LIVE' if not DRY_RUN else 'DRY'}")
+    if avail < 1.20:
+        log("balance mínimo, parado."); return st
+
+    res = top_rumor_discovery(spike_window_minutes=120, baseline_hours=12, max_pages=25,
+                              top_n=12, min_total_mentions=3, with_price=True,
+                              short_window_minutes=30, tradeable_only=True, exclude_noise=True)
+    by_coin = {t["coin"]: t for t in res.get("top", [])}
+    from collections import Counter as _C
+    log(f"top: {res.get('posts_fetched')} posts, " +
+        str(dict(_C(t.get('directive', '?') for t in res.get('top', [])))))
+
+    # 1) GESTIONAR ABIERTAS: multitud llegando o sentimiento volteado = salir
+    for p in pos:
+        sym = p["symbol"]; coin = sym.replace("USDT", "")
+        t = by_coin.get(coin, {})
+        is_long = float(p["positionAmt"]) > 0
+        net = t.get("net_early", 0)
+        crowd = t.get("is_crowd_arriving", False)
+        reason = None
+        if crowd:
+            reason = "multitud llegando (views)"
+        elif is_long and net <= -2:
+            reason = "sentimiento volteó a bear"
+        elif not is_long and net >= 2:
+            reason = "sentimiento volteó a bull"
+        if reason:
+            pnl = float(p.get("unRealizedProfit", 0))
+            log(f"SALIDA {sym} pnl={pnl:.3f} ({reason})")
+            beep("exit_win" if pnl >= 0 else "exit_loss")
+            if not DRY_RUN:
+                close_market(sym, p["positionAmt"], p["positionSide"])
+                st["day_pnl"] = round(st["day_pnl"] + pnl, 4)
+            else:
+                log("(dry-run, no se cierra)")
+
+    # 2) ENTRAR: solo si hay campo
+    _, pos = positions() if not DRY_RUN else (avail, pos)
+    if len(pos) >= MAX_POS:
+        log("sin campo."); return st
+    for t in res.get("top", []):
+        d = t.get("directive", "WAIT")
+        if d not in ("ENTER_EARLY_LONG", "ENTER_EARLY_SHORT"):
+            continue
+        coin = t["coin"]; sym = f"{coin}USDT"
+        last = st["traded"].get(coin, 0)
+        if time.time() - last < COOLDOWN_H * 3600:
+            log(f"{coin}: cooldown."); continue
+        # confirmación técnica rápida (sin scan completo): flow + book alineados
+        side = "LONG" if d == "ENTER_EARLY_LONG" else "SHORT"
+        fl = (flow_bias(sym) or {}).get("bias", "unknown")
+        bk = (book_bias(sym) or {}).get("bias", "unknown")
+        want = "bullish" if side == "LONG" else "bearish"
+        if fl != want or bk != want:
+            log(f"{coin}: directiva {d} pero flow={fl} book={bk} no confirman. Skip."); continue
+        px = float(requests.get(BASE + "/fapi/v1/ticker/price", params={"symbol": sym}, timeout=10).json()["price"])
+        _, step, _ = filters(sym)
+        qty = rnd_step(NOTIONAL / px, step)
+        log(f"ENTRADA {sym} {side} qty={qty} @{px} ({t.get('directive_reason')})")
+        beep("entry")
+        if not DRY_RUN:
+            try:
+                signed("POST", "/fapi/v1/leverage", {"symbol": sym, "leverage": 10})
+            except Exception as e:
+                log(f"lev: {e}")
+            so = "BUY" if side == "LONG" else "SELL"
+            o = signed("POST", "/fapi/v1/order", {"symbol": sym, "side": so, "type": "MARKET",
+                                                  "quantity": qty, "positionSide": side})
+            if "orderId" not in o:
+                log(f"ERROR entrada: {o}"); return st
+            cs = "SELL" if side == "LONG" else "BUY"
+            tp = px * (1.05 if side == "LONG" else 0.95)
+            sl = px * (0.93 if side == "LONG" else 1.07)
+            signed("POST", "/fapi/v1/order", {"symbol": sym, "side": cs, "type": "TAKE_PROFIT_MARKET",
+                                              "stopPrice": round(tp, 8), "closePosition": "true", "positionSide": side})
+            signed("POST", "/fapi/v1/order", {"symbol": sym, "side": cs, "type": "STOP_MARKET",
+                                              "stopPrice": round(sl, 8), "closePosition": "true", "positionSide": side})
+            log(f"ABIERTA {sym} TP={tp:.4g} SL={sl:.4g}")
+            st["traded"][coin] = time.time()
+        else:
+            log("(dry-run, no se abre)")
+        break
+    return st
+
+if __name__ == "__main__":
+    sync_clock()
+    while True:
+        try:
+            save_state(run_once())
+        except Exception as e:
+            log(f"ERROR loop: {e}")
+        log("--- esperando 10 min ---")
+        time.sleep(600)
