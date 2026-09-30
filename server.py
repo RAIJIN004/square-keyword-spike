@@ -482,7 +482,10 @@ CASHTAG_RE = re.compile(r"\$([A-Z]{2,12})\b")
 STOP_COINS = {"US", "USA", "ETF", "AI", "IT", "ON", "GO", "UP", "TV", "CEO", "ATM", "VIP", "NFT", "DEFI"}
 # stablecoins y acciones (ruido para trading de momentum: se excluyen con exclude_noise=True)
 NOISE_COINS = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "USDE", "T", "MU", "NVDA", "AAPL", "TSLA",
-               "GOOGL", "ARM", "DELL", "HOODB", "MSTR", "COIN", "AMD", "INTC", "META", "AMZN"}
+               "GOOGL", "ARM", "DELL", "HOODB", "MSTR", "COIN", "AMD", "INTC", "META", "AMZN",
+               # tokens de acciones apalancadas/fraccionadas (sufijo B): ruido para spot momentum
+               "SPCXB", "AAPLB", "NVDAB", "GOOGLB", "CRCLB", "MRNAB", "QQQB", "SPYB", "TSLAB",
+               "QQQ", "SPX", "SPY"}
 
 def extract_coins_from_post(text: str, hashtags: List[str], trading_pairs: List[Dict]) -> List[str]:
     """Extrae códigos de moneda de un post: tradingPairsV2.code + $CASHTAG + #hashtag."""
