@@ -72,10 +72,12 @@ def fetch_square_posts(max_pages: int = 25, page_size: int = 20) -> List[Dict[st
                 if not pid or pid in seen:
                     continue
                 seen.add(pid)
-                # normalizar campos
+                # normalizar campos (subTitle trae el texto largo en BUZZ_LONG)
                 content = p.get("content") or p.get("body") or p.get("text") or ""
                 title = p.get("title") or ""
-                full_text = f"{title} {content}".strip()
+                subtitle = p.get("subTitle") or ""
+                full_text = f"{title} {subtitle} {content}".strip()
+                tps = p.get("tradingPairsV2") or p.get("tradingPairs") or []
                 # fecha: puede venir en ms
                 ts = p.get("date") or p.get("publishTime") or p.get("createTime") or 0
                 # hashtags
@@ -86,6 +88,7 @@ def fetch_square_posts(max_pages: int = 25, page_size: int = 20) -> List[Dict[st
                     "id": pid,
                     "text": full_text,
                     "hashtags": hashtags,
+                    "trading_pairs": tps if isinstance(tps, list) else [],
                     "timestamp": ts,
                     "viewCount": p.get("viewCount", 0),
                     "likeCount": p.get("likeCount", 0),
@@ -115,10 +118,13 @@ def fetch_square_posts(max_pages: int = 25, page_size: int = 20) -> List[Dict[st
                 seen.add(pid)
                 content = p.get("content") or ""
                 title = p.get("title") or ""
+                subtitle = p.get("subTitle") or ""
+                tps2 = p.get("tradingPairsV2") or p.get("tradingPairs") or []
                 posts.append({
                     "id": pid,
-                    "text": f"{title} {content}".strip(),
+                    "text": f"{title} {subtitle} {content}".strip(),
                     "hashtags": p.get("hashtagList") or [],
+                    "trading_pairs": tps2 if isinstance(tps2, list) else [],
                     "timestamp": p.get("date") or 0,
                     "viewCount": p.get("viewCount", 0),
                     "likeCount": p.get("likeCount", 0),
@@ -403,6 +409,185 @@ def scan_all_rumors(
         "ranking_spikes": all_spikes,
         "top": all_spikes[:5],
         "note": "z>=2 = pico irregular. corr% = qué % de menciones globales de esa keyword están atadas a esa moneda en la ventana."
+    }
+
+CASHTAG_RE = re.compile(r"\$([A-Z]{2,12})\b")
+# tokens comunes que NO son monedas (evitan ruido)
+STOP_COINS = {"US", "USA", "ETF", "AI", "IT", "ON", "GO", "UP", "TV", "CEO", "ATM", "VIP", "NFT", "DEFI"}
+
+def extract_coins_from_post(text: str, hashtags: List[str], trading_pairs: List[Dict]) -> List[str]:
+    """Extrae códigos de moneda de un post: tradingPairsV2.code + $CASHTAG + #hashtag."""
+    found = set()
+    for t in (trading_pairs or []):
+        code = str(t.get("code", "")).upper().strip()
+        # quitar sufijos tipo .US (stocks) y prefijos numéricos (1000FLOKI)
+        code = re.sub(r"\.US$", "", code)
+        code = re.sub(r"^\d+", "", code)
+        if 2 <= len(code) <= 12 and code not in STOP_COINS:
+            found.add(code)
+    tl = text or ""
+    for m in CASHTAG_RE.findall(tl):
+        c = re.sub(r"^\d+", "", m.upper())
+        if 2 <= len(c) <= 12 and c not in STOP_COINS:
+            found.add(c)
+    for h in (hashtags or []):
+        c = re.sub(r"^\d+", "", normalize_text(str(h)).lstrip("#$").upper())
+        if 2 <= len(c) <= 12 and c not in STOP_COINS and re.fullmatch(r"[A-Z0-9]+", c or ""):
+            found.add(c)
+    return sorted(found)
+
+def get_24h_change(symbol_usdt: str, session: requests.Session) -> Dict[str, Any]:
+    """Precio + cambio 24h vía API pública de Binance (sin key)."""
+    try:
+        r = session.get("https://api.binance.com/api/v3/ticker/24hr",
+                        params={"symbol": symbol_usdt}, timeout=8)
+        if r.status_code == 200:
+            d = r.json()
+            return {"price": float(d["lastPrice"]), "chg_24h": float(d["priceChangePercent"]),
+                    "quote_vol": float(d["quoteVolume"])}
+    except Exception:
+        pass
+    return {}
+
+@mcp.tool()
+def top_rumor_discovery(
+    spike_window_minutes: int = 90,
+    baseline_hours: int = 12,
+    max_pages: int = 30,
+    top_n: int = 10,
+    min_total_mentions: int = 3,
+    with_price: bool = True,
+) -> dict:
+    """
+    DESCUBRIMIENTO GENERAL: top de monedas con pico irregular de menciones en Square,
+    sin listas fijas. Extrae todas las monedas ($CASHTAG, tradingPairs, hashtags),
+    compara ventana actual vs baseline (z-score Poisson, funciona con conteos bajos),
+    y cruza con precio/cambio 24h de Binance para rankear.
+
+    Args:
+        spike_window_minutes: Ventana actual (default 90).
+        baseline_hours: Horas de baseline (default 12).
+        max_pages: Páginas de Square a scrapear (default 30, ~600 posts).
+        top_n: Cuántas devolver (default 10).
+        min_total_mentions: Mínimo de menciones totales para considerar la moneda (default 3).
+        with_price: Si True, cruza con ticker 24h público de Binance.
+
+    Returns:
+        Ranking con z-score, menciones recientes vs esperadas, posts ejemplo, precio y cambio 24h.
+    """
+    posts = fetch_square_posts(max_pages=max_pages)
+    if not posts:
+        return {"error": "Square no devolvió posts (API bloqueada o sin datos). Reintenta."}
+
+    now = datetime.now(timezone.utc)
+    spike_start = now - timedelta(minutes=spike_window_minutes)
+    baseline_start = now - timedelta(hours=baseline_hours)
+
+    # menciones por moneda por hora
+    hourly = defaultdict(lambda: Counter())
+    coin_posts_recent = defaultdict(list)  # coin -> posts en ventana spike
+
+    for p in posts:
+        dt = p.get("datetime")
+        if not dt or dt < baseline_start:
+            continue
+        text = p.get("text", "")
+        # trading pairs vienen en el raw? fetch normaliza; re-derivar de hashtags+texto
+        coins = extract_coins_from_post(text, p.get("hashtags", []), p.get("trading_pairs", []))
+        if not coins:
+            continue
+        hk = dt.replace(minute=0, second=0, microsecond=0).isoformat()
+        for c in coins:
+            hourly[hk][c] += 1
+            if dt >= spike_start:
+                if len(coin_posts_recent[c]) < 3:
+                    coin_posts_recent[c].append({
+                        "text": text[:220].replace("\n", " "),
+                        "time": dt.isoformat(),
+                        "views": p.get("viewCount"),
+                    })
+
+    hours_sorted = sorted(hourly.keys())
+    # última hora completa + fracción actual: usar ventana spike como tasa
+    window_h = spike_window_minutes / 60.0
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    ranked = []
+    totals = Counter()
+    for h in hours_sorted:
+        totals.update(hourly[h])
+
+    for coin, total in totals.items():
+        if total < min_total_mentions:
+            continue
+        # serie horaria excluyendo la ventana actual (aprox: excluir última hora si spike<=60, si no prorratear)
+        series = []
+        for h in hours_sorted:
+            # parsear hora
+            try:
+                hh = datetime.fromisoformat(h)
+            except Exception:
+                continue
+            if hh >= spike_start - timedelta(hours=1):
+                continue
+            series.append(hourly[h][coin])
+        if not series:
+            series = [0]
+        mean_h = statistics.mean(series)
+        # Poisson z: (actual - esperado) / sqrt(esperado + 1) — funciona con conteos bajos
+        # contar menciones en ventana spike directamente:
+        recent = 0
+        for h in hours_sorted:
+            try:
+                hh = datetime.fromisoformat(h)
+            except Exception:
+                continue
+            if hh >= spike_start - timedelta(hours=1):
+                recent += hourly[h][coin]
+        expected = mean_h * window_h
+        z = (recent - expected) / math.sqrt(expected + 1)
+        # ratio velocidad
+        ratio = recent / (expected + 0.5)
+
+        item = {
+            "coin": coin,
+            "total_mentions": total,
+            "recent_mentions": recent,
+            "expected_in_window": round(expected, 2),
+            "baseline_per_hour": round(mean_h, 2),
+            "z_poisson": round(z, 2),
+            "velocity_ratio": round(ratio, 2),
+            "is_spike": bool(z >= 2.0 and recent > 0),
+            "is_warming": bool(1.0 <= z < 2.0 and recent > 0),
+        }
+        if with_price:
+            for suffix in ("USDT",):
+                px = get_24h_change(f"{coin}{suffix}", session)
+                if px:
+                    item["price"] = px["price"]
+                    item["chg_24h"] = px["chg_24h"]
+                    item["quote_vol_24h"] = round(px["quote_vol"], 0)
+                    break
+        # score ranking: z ponderado por momentum alineado (menciones+precio mismo signo sube)
+        mom = abs(item.get("chg_24h", 0))
+        item["rank_score"] = round(z * (1 + min(mom, 20) / 20), 2)
+        item["examples"] = coin_posts_recent.get(coin, [])[:2]
+        ranked.append(item)
+
+    ranked.sort(key=lambda x: (x["rank_score"], x["recent_mentions"]), reverse=True)
+    spikes = [r for r in ranked if r["is_spike"]]
+    warming = [r for r in ranked if r["is_warming"]]
+    return {
+        "posts_fetched": len(posts),
+        "window": f"{spike_window_minutes}m vs baseline {baseline_hours}h",
+        "coins_tracked": len(ranked),
+        "spikes_detected": len(spikes),
+        "warming_up": len(warming),
+        "top": ranked[:top_n],
+        "note": ("z_poisson>=2 = pico irregular (funciona con pocas menciones). "
+                 "warming = acelerando (1-2). Cruza rank_score con chg_24h: spike + momentum = candidato Hermes. "
+                 "Si el top ya está lleno de posts con mismos niveles = techo de atención, NO entrar (regla BE)."),
     }
 
 if __name__ == "__main__":
