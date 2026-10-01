@@ -72,19 +72,39 @@ def run_once():
                               top_n=12, min_total_mentions=3, with_price=True,
                               short_window_minutes=30, tradeable_only=True, exclude_noise=True)
     by_coin = {t["coin"]: t for t in res.get("top", [])}
+    # Para monedas abiertas sin burst visible en el top: veredicto rápido individual
+    # (el top solo trae min_total_mentions>=3; una moneda enfriándose desaparece del top)
+    from server import coin_signal as _cs
+    for p in pos:
+        _c = p["symbol"].replace("USDT", "")
+        if _c not in by_coin:
+            try:
+                _s = _cs(coin=_c, window_minutes=180, max_pages=10)
+                by_coin[_c] = {"coin": _c, "directive": "WAIT",
+                               "net_early": _s.get("bull_hits", 0) - _s.get("bear_hits", 0),
+                               "is_crowd_arriving": False,
+                               "early_mentions_proxy": _s.get("early_mentions_30m", 0),
+                               "early_z_proxy": _s.get("early_z", 0),
+                               "mentions_proxy": _s.get("mentions", 0)}
+            except Exception as e:
+                log(f"coin_signal {_c}: {e}")
     from collections import Counter as _C
     log(f"top: {res.get('posts_fetched')} posts, " +
         str(dict(_C(t.get('directive', '?') for t in res.get('top', [])))) +
         " | ENTER: " + str([(t['coin'], t.get('directive')) for t in res.get('top', [])
                              if 'ENTER' in t.get('directive', '')]))
 
-    # 1) GESTIONAR ABIERTAS: multitud llegando o sentimiento volteado = salir
+    # 1) GESTIONAR ABIERTAS: multitud, flip o RELEVANCIA PERDIDA = salir
+    qc = st.setdefault("quiet_cycles", {})
     for p in pos:
         sym = p["symbol"]; coin = sym.replace("USDT", "")
         t = by_coin.get(coin, {})
         is_long = float(p["positionAmt"]) > 0
         net = t.get("net_early", 0)
         crowd = t.get("is_crowd_arriving", False)
+        early_m = t.get("early_mentions_proxy",
+                      t.get("early_mentions", t.get("early_mentions_30m", 1)))
+        pnl = float(p.get("unRealizedProfit", 0))
         reason = None
         if crowd:
             reason = "multitud llegando (views)"
@@ -92,6 +112,14 @@ def run_once():
             reason = "sentimiento volteó a bear"
         elif not is_long and net >= 2:
             reason = "sentimiento volteó a bull"
+        else:
+            # RELEVANCIA PERDIDA: sin menciones tempranas 2 ciclos seguidos + en profit = cobrar
+            if early_m == 0:
+                qc[coin] = qc.get(coin, 0) + 1
+            else:
+                qc[coin] = 0
+            if qc.get(coin, 0) >= 2 and pnl >= 0:
+                reason = f"relevancia perdida ({qc[coin]} ciclos sin menciones, pnl={pnl:.3f})"
         if reason:
             pnl = float(p.get("unRealizedProfit", 0))
             log(f"SALIDA {sym} pnl={pnl:.3f} ({reason})")
