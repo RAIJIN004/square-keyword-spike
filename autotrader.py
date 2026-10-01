@@ -91,8 +91,8 @@ def run_once():
     from collections import Counter as _C
     log(f"top: {res.get('posts_fetched')} posts, " +
         str(dict(_C(t.get('directive', '?') for t in res.get('top', [])))) +
-        " | ENTER: " + str([(t['coin'], t.get('directive')) for t in res.get('top', [])
-                             if 'ENTER' in t.get('directive', '')]))
+        " | SEÑALES: " + str([(t['coin'], t.get('directive')) for t in res.get('top', [])
+                             if t.get('directive', 'WAIT') != 'WAIT']))
 
     # 1) GESTIONAR ABIERTAS: multitud, flip o RELEVANCIA PERDIDA = salir
     qc = st.setdefault("quiet_cycles", {})
