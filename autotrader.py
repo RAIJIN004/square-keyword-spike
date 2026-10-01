@@ -152,8 +152,11 @@ def run_once():
         if fl != want or bk != want:
             log(f"{coin}: directiva {d} pero flow={fl} book={bk} no confirman. Skip."); continue
         px = float(requests.get(BASE + "/fapi/v1/ticker/price", params={"symbol": sym}, timeout=10).json()["price"])
-        _, step, _ = filters(sym)
+        _, step, minqty = filters(sym)
         qty = rnd_step(NOTIONAL / px, step)
+        if qty <= 0 or qty < (minqty or 0) or qty * px < 5.0:
+            log(f"{coin}: sin tamaño para la cuenta (qty={qty} notional={qty*px:.2f}, mín 0.001BTC=$84). Skip al siguiente.")
+            continue
         log(f"ENTRADA {sym} {side} qty={qty} @{px} ({t.get('directive_reason')})")
         beep("entry")
         if not DRY_RUN:
