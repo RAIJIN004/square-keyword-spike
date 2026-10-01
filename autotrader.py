@@ -64,8 +64,9 @@ def run_once():
 
     avail, pos = positions()
     log(f"balance disp={avail:.2f} abiertas={[p['symbol'] for p in pos]} modo={'LIVE' if not DRY_RUN else 'DRY'}")
-    if avail < 1.20:
-        log("balance mínimo, parado."); return st
+    low_balance = avail < 1.20
+    if low_balance:
+        log("balance mínimo: solo GESTIÓN, sin entradas nuevas.")
 
     res = top_rumor_discovery(spike_window_minutes=120, baseline_hours=12, max_pages=25,
                               top_n=12, min_total_mentions=3, with_price=True,
@@ -73,7 +74,9 @@ def run_once():
     by_coin = {t["coin"]: t for t in res.get("top", [])}
     from collections import Counter as _C
     log(f"top: {res.get('posts_fetched')} posts, " +
-        str(dict(_C(t.get('directive', '?') for t in res.get('top', [])))))
+        str(dict(_C(t.get('directive', '?') for t in res.get('top', [])))) +
+        " | ENTER: " + str([(t['coin'], t.get('directive')) for t in res.get('top', [])
+                             if 'ENTER' in t.get('directive', '')]))
 
     # 1) GESTIONAR ABIERTAS: multitud llegando o sentimiento volteado = salir
     for p in pos:
@@ -99,8 +102,10 @@ def run_once():
             else:
                 log("(dry-run, no se cierra)")
 
-    # 2) ENTRAR: solo si hay campo
+    # 2) ENTRAR: solo si hay campo Y balance suficiente
     _, pos = positions() if not DRY_RUN else (avail, pos)
+    if low_balance:
+        log("sin entradas por balance mínimo."); return st
     if len(pos) >= MAX_POS:
         log("sin campo."); return st
     for t in res.get("top", []):
