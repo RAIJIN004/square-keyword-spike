@@ -187,5 +187,5 @@ if __name__ == "__main__":
             save_state(run_once())
         except Exception as e:
             log(f"ERROR loop: {e}")
-        log("--- esperando 10 min ---")
-        time.sleep(600)
+        log("--- esperando 5 min ---")
+        time.sleep(300)
