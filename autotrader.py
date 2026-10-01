@@ -150,7 +150,7 @@ def run_once():
         bk = (book_bias(sym) or {}).get("bias", "unknown")
         want = "bullish" if side == "LONG" else "bearish"
         if fl != want or bk != want:
-            log(f"{coin}: directiva {d} pero flow={fl} book={bk} no confirman. Skip."); continue
+            log(f"{coin}: AVISO flow={fl} book={bk} van en contra, se entra igual por directiva {d}.")
         px = float(requests.get(BASE + "/fapi/v1/ticker/price", params={"symbol": sym}, timeout=10).json()["price"])
         _, step, minqty = filters(sym)
         qty = rnd_step(NOTIONAL / px, step)
