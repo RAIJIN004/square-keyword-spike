@@ -467,9 +467,11 @@ def save_state(hourly: Dict[str, Dict[str, int]], keep_hours: int = 72) -> None:
         st = load_state()
         agg = defaultdict(Counter)
         for h, counts in st.get("hourly", {}).items():
-            agg[h].update(counts)
+            for c, n in counts.items():
+                agg[h][c] = max(agg[h][c], n)
         for h, counts in hourly.items():
-            agg[h].update(counts)
+            for c, n in counts.items():
+                agg[h][c] = max(agg[h][c], n)
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=keep_hours)).isoformat()
         pruned = {h: {c: n for c, n in dict(counts).items() if not is_noise_coin(c)}
                   for h, counts in agg.items() if h >= cutoff}
@@ -486,7 +488,7 @@ NOISE_COINS = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "USDE", "T", "MU", "NVDA"
                "GOOGL", "ARM", "DELL", "HOODB", "MSTR", "COIN", "AMD", "INTC", "META", "AMZN",
                # tokens de acciones apalancadas/fraccionadas (sufijo B): ruido para spot momentum
                "SPCXB", "AAPLB", "NVDAB", "GOOGLB", "CRCLB", "MRNAB", "QQQB", "SPYB", "TSLAB",
-               "QQQ", "SPX", "SPY"}
+               "QQQ", "SPX", "SPY", "BEB"}
 
 STOCK_ROOTS = {"META", "MSFT", "NVDA", "AAPL", "TSLA", "GOOGL", "AMD", "INTC", "BABA",
                "PDD", "AMZN", "TSM", "AVGO", "NFLX", "COIN", "HOOD", "DELL", "ARM", "MU",
