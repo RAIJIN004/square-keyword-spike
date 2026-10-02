@@ -153,9 +153,16 @@ def run_once():
             log(f"{coin}: AVISO flow={fl} book={bk} van en contra, se entra igual por directiva {d}.")
         px = float(requests.get(BASE + "/fapi/v1/ticker/price", params={"symbol": sym}, timeout=10).json()["price"])
         _, step, minqty, minnot = filters(sym)
-        qty = rnd_step(max(NOTIONAL, minnot or 5.0) / px, step)
+        import math as _m
+        raw = max(NOTIONAL, minnot or 5.0) / px
+        qty = _m.floor(raw / step) * step if step else raw
+        if qty * px < (minnot or 5.0):
+            qty = round(qty + (step or 0), 8)  # subir un step para cumplir mínimo
         if qty <= 0 or qty < (minqty or 0) or qty * px < (minnot or 5.0):
             log(f"{coin}: sin tamaño para la cuenta (qty={qty} notional={qty*px:.2f} mín={minnot}). Skip al siguiente.")
+            continue
+        if qty * px / 10 > avail:
+            log(f"{coin}: sin margen (necesita {qty*px/10:.2f}, hay {avail:.2f}). Skip.")
             continue
         log(f"ENTRADA {sym} {side} qty={qty} @{px} ({t.get('directive_reason')})")
         beep("entry")
