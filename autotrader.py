@@ -189,11 +189,19 @@ def run_once():
     if len(pos) >= MAX_POS:
         log("sin campo."); return st
     # VETO DIRECCIONAL BTC: si BTC va long, PROHIBIDO shortear alts (arrastra todo);
-    # si BTC va bear, prohibido longear alts. Medido solo por comunidad (net_early BTC).
-    _btc = by_coin.get("BTC", {})
-    _btc_net = _btc.get("net_early", 0) or 0
-    _ban_alt_short = _btc_net >= 2
-    _ban_alt_long = _btc_net <= -2
+    # si BTC va bear, prohibido longear alts. Medido con el gauge SENSIBLE
+    # (sin mínimos: define dirección hasta con pocos datos).
+    from server import accel_gauge as _gauge
+    try:
+        _g = _gauge(coins=["BTC"], window_minutes=60, max_pages=8)
+        _gg = (_g.get("gauges") or [{}])[0]
+        _btc_net = _gg.get("net_total", 0)
+        log(f"gauge BTC: { _gg.get('gauge')} {_gg.get('trend')} (net={_btc_net}, n={_gg.get('mentions')})")
+    except Exception as e:
+        log(f"gauge BTC falló ({e}), sin veto direccional.")
+        _btc_net = 0
+    _ban_alt_short = _btc_net >= 1
+    _ban_alt_long = _btc_net <= -1
     if _ban_alt_short:
         log(f"BTC long en comunidad (net={_btc_net}): prohibido SHORT en alts.")
     if _ban_alt_long:
