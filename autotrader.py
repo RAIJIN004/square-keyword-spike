@@ -16,7 +16,7 @@ COOLDOWN_H = 6
 DAILY_STOP = -0.50
 STATE = r"C:\Users\jhonv\Downloads\square-keyword-spike\autotrader_state.json"
 
-from unified import flow_bias, book_bias
+from unified import klines as _btc_klines  # solo régimen BTC para el árbitro (no dirección)
 from hourly_loop import signed, sync_clock, filters, rnd_step, BASE
 import requests
 
@@ -75,7 +75,7 @@ def run_once():
     # Régimen BTC actual para el árbitro (¿volteó contra la posición?)
     try:
         from unified import klines as _kl
-        _bc = [float(k[4]) for k in _kl("BTCUSDT", "15m", 17)]
+        _bc = [float(k[4]) for k in _btc_klines("BTCUSDT", "15m", 17)]
         btc_4h = round((_bc[-1] / _bc[0] - 1) * 100, 2) if _bc[0] else 0
     except Exception:
         btc_4h = 0.0
@@ -178,11 +178,8 @@ def run_once():
             log(f"{coin}: cooldown."); continue
         # confirmación técnica rápida (sin scan completo): flow + book alineados
         side = "LONG" if d == "ENTER_EARLY_LONG" else "SHORT"
-        fl = (flow_bias(sym) or {}).get("bias", "unknown")
-        bk = (book_bias(sym) or {}).get("bias", "unknown")
-        want = "bullish" if side == "LONG" else "bearish"
-        if fl != want or bk != want:
-            log(f"{coin}: AVISO flow={fl} book={bk} van en contra, se entra igual por directiva {d}.")
+        # Dirección SOLO por comunidad (directiva). Flow/book retirados del path:
+        # comprobado que definir dirección con datos es arriesgado y bloquea entradas buenas.
         px = float(requests.get(BASE + "/fapi/v1/ticker/price", params={"symbol": sym}, timeout=10).json()["price"])
         _, step, minqty, minnot = filters(sym)
         import math as _m
