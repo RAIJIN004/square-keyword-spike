@@ -58,6 +58,16 @@ def rnd_step(x, step):
     import math
     return math.floor(x / step) * step if step else x
 
+def max_leverage(sym):
+    """Apalancamiento máximo permitido por Binance para el símbolo."""
+    try:
+        d = signed("GET", "/fapi/v1/leverageBracket", {"symbol": sym})
+        if isinstance(d, list) and d:
+            return int(d[0].get("brackets", [{}])[0].get("initialLeverage", 20))
+        return int(d.get("maxLeverage", 20)) if isinstance(d, dict) else 20
+    except Exception:
+        return 20
+
 def cycle(n):
     from unified import scan, flow_bias
     from server import fetch_square_posts, extract_coins_from_post
