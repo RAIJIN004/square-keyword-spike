@@ -156,6 +156,31 @@ def run_once():
             log(f"*** ALERTA SALIDA {sym} pnl={pnl:.3f} ({reason}) — cerrar MANUAL ***")
             beep("exit_win" if pnl >= 0 else "exit_loss")
 
+    # ESTADO de abiertas (cada ciclo, para decidir salida a ojo):
+    # mark, PnL/ROE, % al TP y al SL, sentimiento 30m, ciclos callados, edad
+    for p in pos:
+        try:
+            sym = p["symbol"]; coin = sym.replace("USDT", "")
+            entry_c = float(p.get("entryPrice", 0)); mark_c = float(p.get("markPrice", entry_c))
+            pnl_c = float(p.get("unRealizedProfit", 0))
+            init_c = float(p.get("positionInitialMargin", 0)) or 1
+            t = by_coin.get(coin, {})
+            ctx = st.get("open_ctx", {}).get(sym, {})
+            age = f"{(time.time()-ctx['t0'])/60:.0f}m" if ctx.get("t0") else "manual"
+            dist = ""
+            if ctx.get("tp") and ctx.get("sl") and entry_c:
+                tp_c, sl_c = float(ctx["tp"]), float(ctx["sl"])
+                d_tp = (tp_c - mark_c) / mark_c * 100
+                d_sl = (mark_c - sl_c) / mark_c * 100
+                dist = f"alTP={d_tp:+.2f}% alSL={d_sl:+.2f}% | "
+            log(f"ESTADO {sym} {p.get('positionSide')} entry={entry_c} mark={mark_c} "
+                f"pnl={pnl_c:.3f} ROE={pnl_c/init_c*100:.1f}% edad={age} {dist}"
+                f"early30m={t.get('early_mentions', t.get('early_mentions_proxy', '?'))} "
+                f"net={t.get('net_early', '?')} callados={st.get('quiet_cycles', {}).get(coin, 0)} "
+                f"crowd={t.get('is_crowd_arriving', False)} dir={t.get('directive', '?')}")
+        except Exception as e:
+            log(f"ESTADO error: {e}")
+
     # 2) ENTRAR: solo si hay campo Y balance suficiente
     _, pos = positions() if not DRY_RUN else (avail, pos)
     held_syms = {p["symbol"] for p in pos}
@@ -219,6 +244,8 @@ def run_once():
                                               "stopPrice": round(sl, 8), "closePosition": "true", "positionSide": side})
             log(f"ABIERTA {sym} TP={tp:.4g} SL={sl:.4g}")
             st["traded"][coin] = time.time()
+            st.setdefault("open_ctx", {})[sym] = {"entry": px, "tp": tp, "sl": sl,
+                                                  "side": side, "t0": time.time()}
         else:
             log("(dry-run, no se abre)")
         break
