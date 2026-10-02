@@ -101,11 +101,8 @@ def run_once():
         " | SEÑALES: " + str([(t['coin'], t.get('directive')) for t in res.get('top', [])
                              if t.get('directive', 'WAIT') != 'WAIT']))
 
-    # 1) GESTIONAR ABIERTAS con la vida de LA MISMA moneda (nunca con señales de otras):
-    #    TP/SL mecánicos > saturación post-entrada + profit > relevancia muerta + profit >
-    #    flip de sentimiento > ESTANCAMIENTO (no avanza al TP en 1h) > time-stop 6h > árbitro IA
+    # 1) GESTIONAR ABIERTAS: multitud, flip o RELEVANCIA PERDIDA = salir
     qc = st.setdefault("quiet_cycles", {})
-    octx = st.setdefault("open_ctx", {})
     for p in pos:
         sym = p["symbol"]; coin = sym.replace("USDT", "")
         t = by_coin.get(coin, {})
@@ -130,26 +127,6 @@ def run_once():
                 qc[coin] = 0
             if qc.get(coin, 0) >= 2 and pnl >= 0:
                 reason = f"relevancia perdida ({qc[coin]} ciclos sin menciones, pnl={pnl:.3f})"
-            # ESTANCAMIENTO: la moneda no avanza a su TP en 1h (12 ciclos) = dinero muerto
-            ctx = octx.get(sym)
-            if reason is None and ctx:
-                try:
-                    entry_c, tp_c = float(ctx["entry"]), float(ctx["tp"])
-                    age_min = (time.time() - ctx["t0"]) / 60
-                    mark_c = float(p.get("markPrice", entry_c))
-                    denom = (tp_c - entry_c) or 1e-9
-                    prog = (mark_c - entry_c) / denom
-                    if age_min >= 60 and prog < 0.3 and pnl <= 0:
-                        reason = f"estancada ({age_min:.0f}min, progreso al TP {prog:.0%})"
-                except Exception:
-                    pass
-            # TIME-STOP 6h sin profit
-            if reason is None and ctx:
-                try:
-                    if (time.time() - ctx["t0"]) / 3600 >= 6 and pnl <= 0:
-                        reason = "time-stop 6h sin profit"
-                except Exception:
-                    pass
             # NIVEL 2 — ÁRBITRO IA: pérdida + posible volteo de régimen BTC o empate total
             init_m = float(p.get("positionInitialMargin", 1)) or 1
             roe = pnl / init_m * 100
@@ -179,8 +156,6 @@ def run_once():
             if not DRY_RUN:
                 close_market(sym, p["positionAmt"], p["positionSide"])
                 st["day_pnl"] = round(st["day_pnl"] + pnl, 4)
-                st.get("open_ctx", {}).pop(sym, None)
-                st.get("quiet_cycles", {}).pop(coin, None)
             else:
                 log("(dry-run, no se cierra)")
 
@@ -247,7 +222,6 @@ def run_once():
                                               "stopPrice": round(sl, 8), "closePosition": "true", "positionSide": side})
             log(f"ABIERTA {sym} TP={tp:.4g} SL={sl:.4g}")
             st["traded"][coin] = time.time()
-            st.setdefault("open_ctx", {})[sym] = {"entry": px, "tp": tp, "t0": time.time()}
         else:
             log("(dry-run, no se abre)")
         break
