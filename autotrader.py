@@ -132,6 +132,7 @@ def run_once():
 
     # 2) ENTRAR: solo si hay campo Y balance suficiente
     _, pos = positions() if not DRY_RUN else (avail, pos)
+    held_syms = {p["symbol"] for p in pos}
     if low_balance:
         log("sin entradas por balance mínimo."); return st
     if len(pos) >= MAX_POS:
@@ -141,6 +142,8 @@ def run_once():
         if d not in ("ENTER_EARLY_LONG", "ENTER_EARLY_SHORT"):
             continue
         coin = t["coin"]; sym = f"{coin}USDT"
+        if sym in held_syms:
+            log(f"{coin}: ya abierta, no duplicar."); continue
         last = st["traded"].get(coin, 0)
         if time.time() - last < COOLDOWN_H * 3600:
             log(f"{coin}: cooldown."); continue
@@ -167,8 +170,8 @@ def run_once():
         import math as _m2
         lev = _m2.ceil(need / max(avail, 0.01) * 1.5)  # margen con colchón 50%
         lev = max(1, min(lev, maxlev))
-        if need / lev > avail:
-            log(f"{coin}: sin margen ni a {maxlev}x (necesita {need/lev:.2f}, hay {avail:.2f}). Skip.")
+        if need / lev * 1.2 > avail:
+            log(f"{coin}: sin margen con colchón (necesita {need/lev*1.2:.2f}, hay {avail:.2f}). Skip.")
             continue
         if lev > 10:
             log(f"{coin}: AVISO apalancamiento {lev}x (máx {maxlev}x) para que quepa el mínimo.")
