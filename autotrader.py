@@ -188,19 +188,24 @@ def run_once():
         log("sin entradas por balance mínimo."); return st
     if len(pos) >= MAX_POS:
         log("sin campo."); return st
-    # VETO BTC-DOMINANCIA: si BTC acelera en menciones, las alts sangran.
-    # Solo se permite entrar BTC; las alts se skipean aunque traigan señal.
+    # VETO DIRECCIONAL BTC: si BTC va long, PROHIBIDO shortear alts (arrastra todo);
+    # si BTC va bear, prohibido longear alts. Medido solo por comunidad (net_early BTC).
     _btc = by_coin.get("BTC", {})
-    _btc_hot = (_btc.get("early_mentions", _btc.get("early_mentions_proxy", 0)) or 0) >= 2
-    if _btc_hot:
-        log("BTC acelera en comunidad: veto a altcoins este ciclo (solo BTC).")
+    _btc_net = _btc.get("net_early", 0) or 0
+    _ban_alt_short = _btc_net >= 2
+    _ban_alt_long = _btc_net <= -2
+    if _ban_alt_short:
+        log(f"BTC long en comunidad (net={_btc_net}): prohibido SHORT en alts.")
+    if _ban_alt_long:
+        log(f"BTC bear en comunidad (net={_btc_net}): prohibido LONG en alts.")
     for t in res.get("top", []):
         d = t.get("directive", "WAIT")
         if d not in ("ENTER_EARLY_LONG", "ENTER_EARLY_SHORT"):
             continue
         coin = t["coin"]; sym = f"{coin}USDT"
-        if _btc_hot and coin != "BTC":
-            log(f"{coin}: skipeada por veto BTC-dominancia."); continue
+        _is_short = d == "ENTER_EARLY_SHORT"
+        if coin != "BTC" and ((_is_short and _ban_alt_short) or (not _is_short and _ban_alt_long)):
+            log(f"{coin}: skipeada por veto BTC ({d} contra BTC)."); continue
         if sym in held_syms:
             log(f"{coin}: ya abierta, no duplicar."); continue
         last = st["traded"].get(coin, 0)
