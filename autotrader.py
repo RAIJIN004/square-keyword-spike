@@ -72,6 +72,13 @@ def run_once():
                               top_n=12, min_total_mentions=3, with_price=True,
                               short_window_minutes=30, tradeable_only=True, exclude_noise=True)
     by_coin = {t["coin"]: t for t in res.get("top", [])}
+    # Régimen BTC actual para el árbitro (¿volteó contra la posición?)
+    try:
+        from unified import klines as _kl
+        _bc = [float(k[4]) for k in _kl("BTCUSDT", "15m", 17)]
+        btc_4h = round((_bc[-1] / _bc[0] - 1) * 100, 2) if _bc[0] else 0
+    except Exception:
+        btc_4h = 0.0
     # Para monedas abiertas sin burst visible en el top: veredicto rápido individual
     # (el top solo trae min_total_mentions>=3; una moneda enfriándose desaparece del top)
     from server import coin_signal as _cs
@@ -120,6 +127,28 @@ def run_once():
                 qc[coin] = 0
             if qc.get(coin, 0) >= 2 and pnl >= 0:
                 reason = f"relevancia perdida ({qc[coin]} ciclos sin menciones, pnl={pnl:.3f})"
+            # NIVEL 2 — ÁRBITRO IA: pérdida + posible volteo de régimen BTC o empate total
+            init_m = float(p.get("positionInitialMargin", 1)) or 1
+            roe = pnl / init_m * 100
+            regime_against = (is_long and btc_4h < -0.5) or (not is_long and btc_4h > 0.5)
+            if reason is None and roe < -10 and (regime_against or abs(net) <= 1):
+                try:
+                    from ai_arbiter import arbitrate
+                    brief = {
+                        "posicion": f"{sym} {p['positionSide']} entry={p.get('entryPrice')} mark={p.get('markPrice')}",
+                        "pnl": f"{pnl:.4f} USDT ({roe:.1f}% ROE)",
+                        "BTC_4h": f"{btc_4h}% (régimen {'EN CONTRA' if regime_against else 'neutral/a favor'})",
+                        "sentimiento_coin_30m": f"net={net} (bull-bear)",
+                        "menciones_tempranas": early_m,
+                        "pregunta": ("¿El mercado cambió de dirección (régimen BTC) invalidando la tesis, "
+                                     "o es ruido temporal para HOLD?")
+                    }
+                    arb = arbitrate(brief)
+                    log(f"ÁRBITRO IA {sym}: {arb['decision']} ({arb['reason']}) [{arb.get('model')}]")
+                    if arb["decision"] == "CLOSE":
+                        reason = f"árbitro IA: {arb['reason']}"
+                except Exception as e:
+                    log(f"árbitro {sym}: {e}")
         if reason:
             pnl = float(p.get("unRealizedProfit", 0))
             log(f"SALIDA {sym} pnl={pnl:.3f} ({reason})")
