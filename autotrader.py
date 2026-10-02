@@ -11,7 +11,7 @@ sys.path.insert(0, r"C:\Users\jhonv\Downloads\trend-finder-unified")
 
 DRY_RUN = "--live" not in sys.argv
 NOTIONAL = 10.0
-MAX_POS = 1
+MAX_POS = 2
 COOLDOWN_H = 6
 DAILY_STOP = -0.50
 STATE = r"C:\Users\jhonv\Downloads\square-keyword-spike\autotrader_state.json"
