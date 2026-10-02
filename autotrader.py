@@ -150,14 +150,11 @@ def run_once():
                 except Exception as e:
                     log(f"árbitro {sym}: {e}")
         if reason:
+            # SOLO ALERTA: el bot NUNCA cierra posiciones (TP/SL del exchange protegen).
+            # Las entradas automáticas se mantienen; las salidas son manuales del usuario.
             pnl = float(p.get("unRealizedProfit", 0))
-            log(f"SALIDA {sym} pnl={pnl:.3f} ({reason})")
+            log(f"*** ALERTA SALIDA {sym} pnl={pnl:.3f} ({reason}) — cerrar MANUAL ***")
             beep("exit_win" if pnl >= 0 else "exit_loss")
-            if not DRY_RUN:
-                close_market(sym, p["positionAmt"], p["positionSide"])
-                st["day_pnl"] = round(st["day_pnl"] + pnl, 4)
-            else:
-                log("(dry-run, no se cierra)")
 
     # 2) ENTRAR: solo si hay campo Y balance suficiente
     _, pos = positions() if not DRY_RUN else (avail, pos)
