@@ -45,11 +45,14 @@ def filters(sym):
     info = requests.get(BASE + "/fapi/v1/exchangeInfo", params={"symbol": sym}, timeout=15).json()
     s = info["symbols"][0]
     tick = step = minqty = None
+    minnot = 5.0
     for f in s["filters"]:
         if f["filterType"] == "PRICE_FILTER": tick = float(f["tickSize"])
         if f["filterType"] == "LOT_SIZE":
             step, minqty = float(f["stepSize"]), float(f["minQty"])
-    return tick, step, minqty
+        if f["filterType"] == "MIN_NOTIONAL":
+            minnot = float(f.get("notional", 5.0))
+    return tick, step, minqty, minnot
 
 def rnd_step(x, step):
     import math
@@ -102,14 +105,15 @@ def cycle(n):
             log(f"descartada {sym}: flow {fb} contra {side}"); continue
         # === ABRIR ===
         px = float(requests.get(BASE + "/fapi/v1/ticker/price", params={"symbol": sym}, timeout=10).json()["price"])
-        qty = rnd_step(11.0 / px, filters(sym)[1])
-        if qty <= 0:
-            log(f"descartada {sym}: qty 0"); continue
         try:
             signed("POST", "/fapi/v1/leverage", {"symbol": sym, "leverage": 10})
         except Exception as e:
             log(f"leverage {sym}: {e}")
-        tick, step, minqty = filters(sym)
+        tick, step, minqty, minnot = filters(sym)
+        need = max(11.0, minnot or 5.0)
+        qty = rnd_step(need / px, step)
+        if qty <= 0 or qty * px < (minnot or 5.0):
+            log(f"descartada {sym}: sin tamaño (notional={qty*px:.2f} mín={minnot})"); continue
         side_o = "SELL" if side == "SHORT" else "BUY"
         pos_side = side  # hedge mode
         o = signed("POST", "/fapi/v1/order", {"symbol": sym, "side": side_o, "type": "MARKET",
