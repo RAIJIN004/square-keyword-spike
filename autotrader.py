@@ -120,13 +120,14 @@ def run_once():
         elif not is_long and net >= 2:
             reason = "sentimiento volteó a bull"
         else:
-            # RELEVANCIA PERDIDA: sin menciones tempranas 2 ciclos seguidos + en profit = cobrar
-            if early_m == 0:
+            # ACELERACIÓN PERDIDA + PROFIT (1 ciclo, cubriendo comisiones) = cobrar ya
+            fees = abs(float(p.get("notional", 0))) * 0.0015
+            if early_m == 0 and pnl > fees:
+                reason = (f"aceleración perdida + profit (pnl={pnl:.3f} > fees~{fees:.3f})")
+            elif early_m == 0:
                 qc[coin] = qc.get(coin, 0) + 1
             else:
                 qc[coin] = 0
-            if qc.get(coin, 0) >= 2 and pnl >= 0:
-                reason = f"relevancia perdida ({qc[coin]} ciclos sin menciones, pnl={pnl:.3f})"
             # NIVEL 2 — ÁRBITRO IA: pérdida + posible volteo de régimen BTC o empate total
             init_m = float(p.get("positionInitialMargin", 1)) or 1
             roe = pnl / init_m * 100
@@ -216,9 +217,7 @@ def run_once():
             log(f"{coin}: skipeada por veto BTC ({d} contra BTC)."); continue
         if sym in held_syms:
             log(f"{coin}: ya abierta, no duplicar."); continue
-        last = st["traded"].get(coin, 0)
-        if time.time() - last < COOLDOWN_H * 3600:
-            log(f"{coin}: cooldown."); continue
+        # Sin cooldown: si hay señal nueva, se entra (el usuario lo pidió).
         # confirmación técnica rápida (sin scan completo): flow + book alineados
         side = "LONG" if d == "ENTER_EARLY_LONG" else "SHORT"
         # Dirección SOLO por comunidad (directiva). Flow/book retirados del path:
