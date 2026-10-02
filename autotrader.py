@@ -161,14 +161,18 @@ def run_once():
         if qty <= 0 or qty < (minqty or 0) or qty * px < (minnot or 5.0):
             log(f"{coin}: sin tamaño para la cuenta (qty={qty} notional={qty*px:.2f} mín={minnot}). Skip al siguiente.")
             continue
-        if qty * px / 10 > avail:
-            log(f"{coin}: sin margen (necesita {qty*px/10:.2f}, hay {avail:.2f}). Skip.")
-            continue
+        lev = 10
+        if qty * px / lev > avail:
+            lev = 25  # respaldo: mismo trade, menos margen (más riesgo, liq más cerca)
+            if qty * px / lev > avail:
+                log(f"{coin}: sin margen ni a 25x (necesita {qty*px/lev:.2f}, hay {avail:.2f}). Skip.")
+                continue
+            log(f"{coin}: AVISO apalancamiento 25x por margen (liq más cerca).")
         log(f"ENTRADA {sym} {side} qty={qty} @{px} ({t.get('directive_reason')})")
         beep("entry")
         if not DRY_RUN:
             try:
-                signed("POST", "/fapi/v1/leverage", {"symbol": sym, "leverage": 10})
+                signed("POST", "/fapi/v1/leverage", {"symbol": sym, "leverage": lev})
             except Exception as e:
                 log(f"lev: {e}")
             so = "BUY" if side == "LONG" else "SELL"
