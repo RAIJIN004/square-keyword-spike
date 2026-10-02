@@ -1042,5 +1042,90 @@ def coin_signal(
         "reasons": reasons,
     }
 
+@mcp.tool()
+def accel_gauge(
+    coins: List[str] = None,
+    window_minutes: int = 60,
+    max_pages: int = 12,
+) -> dict:
+    """
+    MEDIDOR SENSIBLE de aceleración: qué prevalece (bull/bear) aunque NO dé para entrar.
+    Umbrales bajos a propósito: mide presión, no genera entradas ni salidas.
+
+    Returns por moneda: menciones, presión neta bull-bear, gauge
+    (BULL fuerte/leve, plana, bear leve/fuerte), tendencia (subiendo/bajando/estable
+    vs la hora previa) y delta vs la última medición guardada.
+    """
+    if not coins:
+        coins = ["BTC", "ETH", "HYPE", "XRP", "SOL", "ADA"]
+    coins = [c.strip().upper().lstrip("$#") for c in coins if c.strip()]
+    posts = fetch_square_posts(max_pages=max_pages)
+    if not posts:
+        return {"error": "Square sin datos. Reintenta."}
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(minutes=window_minutes)
+    half = now - timedelta(minutes=window_minutes / 2)
+
+    st = load_state()
+    prev = st.get("gauge", {})
+    cur_gauge = {}
+    out = []
+    for coin in coins:
+        evs = []
+        for p in posts:
+            dt = p.get("datetime")
+            if not dt or dt < start:
+                continue
+            text = p.get("text", "")
+            if contains_coin(text, p.get("hashtags", []), coin):
+                tl = text.lower()
+                evs.append({
+                    "dt": dt,
+                    "bull": sum(1 for w in BULL_WORDS if w in tl),
+                    "bear": sum(1 for w in BEAR_WORDS if w in tl),
+                })
+        n = len(evs)
+        b1 = sum(e["bull"] for e in evs if e["dt"] >= half)
+        r1 = sum(e["bear"] for e in evs if e["dt"] >= half)
+        b0 = sum(e["bull"] for e in evs if e["dt"] < half)
+        r0 = sum(e["bear"] for e in evs if e["dt"] < half)
+        net_now = b1 - r1
+        net_prev = b0 - r0
+        net_tot = sum(e["bull"] for e in evs) - sum(e["bear"] for e in evs)
+        if net_tot >= 4:
+            gauge = "BULL fuerte"
+        elif net_tot >= 1:
+            gauge = "bull leve"
+        elif net_tot <= -4:
+            gauge = "BEAR fuerte"
+        elif net_tot <= -1:
+            gauge = "bear leve"
+        else:
+            gauge = "plana"
+        trend = "subiendo" if net_now > net_prev else ("bajando" if net_now < net_prev else "estable")
+        old = prev.get(coin)
+        delta = None
+        if isinstance(old, dict) and "net" in old:
+            d = net_tot - old["net"]
+            delta = f"{'+' if d >= 0 else ''}{d} vs última medición"
+        cur_gauge[coin] = {"net": net_tot, "n": n}
+        out.append({"coin": coin, "mentions": n, "net_total": net_tot,
+                    "net_2da_mitad": net_now, "net_1ra_mitad": net_prev,
+                    "gauge": gauge, "trend": trend, "delta": delta})
+    st["gauge"] = cur_gauge
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            all_st = load_state()
+            all_st["gauge"] = cur_gauge
+            json.dump(all_st, f)
+    except Exception:
+        pass
+    order = {"BULL fuerte": 0, "bull leve": 1, "plana": 2, "bear leve": 3, "BEAR fuerte": 4}
+    out.sort(key=lambda x: order.get(x["gauge"], 2))
+    return {"window_minutes": window_minutes, "gauges": out,
+            "prevails": (out[0]["gauge"] + " en " + out[0]["coin"]) if out else "sin datos",
+            "note": "Medidor sensible, NO es señal de entrada/salida. Solo muestra qué presión prevalece."}
+
 if __name__ == "__main__":
     mcp.run()
