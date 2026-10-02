@@ -101,7 +101,20 @@ def run_once():
         " | SEÑALES: " + str([(t['coin'], t.get('directive')) for t in res.get('top', [])
                              if t.get('directive', 'WAIT') != 'WAIT']))
 
-    # 1) GESTIONAR ABIERTAS: multitud, flip o RELEVANCIA PERDIDA = salir
+    # Gauge BTC temprano (vale para veto de entradas Y salida cruda por volteo)
+    from server import accel_gauge as _gauge
+    try:
+        _g = _gauge(coins=["BTC"], window_minutes=60, max_pages=8)
+        _gg = (_g.get("gauges") or [{}])[0]
+        _btc_net = _gg.get("net_total", 0)
+        log(f"gauge BTC: {_gg.get('gauge')} {_gg.get('trend')} (net={_btc_net}, n={_gg.get('mentions')})")
+    except Exception as e:
+        log(f"gauge BTC falló ({e}), sin veto direccional.")
+        _btc_net = 0
+
+    # 1) GESTIONAR ABIERTAS. Dos salidas:
+    #    (a) CRUDA: el veto BTC se volteó contra la posición (sin requisito de profit).
+    #    (b) INTERÉS PERDIDO: aceleración muerta + profit cubriendo comisiones.
     qc = st.setdefault("quiet_cycles", {})
     for p in pos:
         sym = p["symbol"]; coin = sym.replace("USDT", "")
@@ -113,7 +126,13 @@ def run_once():
                       t.get("early_mentions", t.get("early_mentions_30m", 1)))
         pnl = float(p.get("unRealizedProfit", 0))
         reason = None
-        if crowd:
+        # SALIDA CRUDA: el veto BTC se volteó contra la posición (sin pedir profit)
+        if coin != "BTC":
+            if is_long and _btc_net <= -1:
+                reason = f"veto BTC volteado a bear (net={_btc_net}), tenías LONG"
+            elif not is_long and _btc_net >= 1:
+                reason = f"veto BTC volteado a bull (net={_btc_net}), tenías SHORT"
+        if reason is None and crowd:
             reason = "multitud llegando (views)"
         elif is_long and net <= -2:
             reason = "sentimiento volteó a bear"
@@ -189,18 +208,7 @@ def run_once():
         log("sin entradas por balance mínimo."); return st
     if len(pos) >= MAX_POS:
         log("sin campo."); return st
-    # VETO DIRECCIONAL BTC: si BTC va long, PROHIBIDO shortear alts (arrastra todo);
-    # si BTC va bear, prohibido longear alts. Medido con el gauge SENSIBLE
-    # (sin mínimos: define dirección hasta con pocos datos).
-    from server import accel_gauge as _gauge
-    try:
-        _g = _gauge(coins=["BTC"], window_minutes=60, max_pages=8)
-        _gg = (_g.get("gauges") or [{}])[0]
-        _btc_net = _gg.get("net_total", 0)
-        log(f"gauge BTC: { _gg.get('gauge')} {_gg.get('trend')} (net={_btc_net}, n={_gg.get('mentions')})")
-    except Exception as e:
-        log(f"gauge BTC falló ({e}), sin veto direccional.")
-        _btc_net = 0
+    # Veto direccional con el gauge ya calculado arriba (vale para entradas y salida cruda).
     _ban_alt_short = _btc_net >= 1
     _ban_alt_long = _btc_net <= -1
     if _ban_alt_short:
