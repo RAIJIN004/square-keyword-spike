@@ -188,11 +188,19 @@ def run_once():
         log("sin entradas por balance mínimo."); return st
     if len(pos) >= MAX_POS:
         log("sin campo."); return st
+    # VETO BTC-DOMINANCIA: si BTC acelera en menciones, las alts sangran.
+    # Solo se permite entrar BTC; las alts se skipean aunque traigan señal.
+    _btc = by_coin.get("BTC", {})
+    _btc_hot = (_btc.get("early_mentions", _btc.get("early_mentions_proxy", 0)) or 0) >= 2
+    if _btc_hot:
+        log("BTC acelera en comunidad: veto a altcoins este ciclo (solo BTC).")
     for t in res.get("top", []):
         d = t.get("directive", "WAIT")
         if d not in ("ENTER_EARLY_LONG", "ENTER_EARLY_SHORT"):
             continue
         coin = t["coin"]; sym = f"{coin}USDT"
+        if _btc_hot and coin != "BTC":
+            log(f"{coin}: skipeada por veto BTC-dominancia."); continue
         if sym in held_syms:
             log(f"{coin}: ya abierta, no duplicar."); continue
         last = st["traded"].get(coin, 0)
