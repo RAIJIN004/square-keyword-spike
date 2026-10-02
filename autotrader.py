@@ -274,9 +274,15 @@ def run_once():
             st["traded"][coin] = time.time()
             st.setdefault("open_ctx", {})[sym] = {"entry": px, "tp": tp, "sl": sl,
                                                   "side": side, "t0": time.time()}
+            held_syms.add(sym)  # no duplicar dentro del mismo ciclo
         else:
             log("(dry-run, no se abre)")
-        break
+        # Sin break: sigue con la siguiente señal del ciclo (hasta MAX_POS).
+        # El margen se re-chequea por trade; refrescar disponible:
+        try:
+            avail = float(signed("GET", "/fapi/v2/account").get("availableBalance", avail))
+        except Exception:
+            pass
     return st
 
 if __name__ == "__main__":
