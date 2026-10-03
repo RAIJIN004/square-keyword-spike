@@ -1,7 +1,9 @@
-"""AUTOTRADER Rumor Burst: monitorea, PITA en entrada, entra y sale solo.
-Sin IA: dirección = voto bull/bear por keywords + confirmación técnica rápida.
-Seguridad: 1 posición, notional ~10, cooldown 6h por moneda, stop diario -0.50 USDT,
-solo opera si balance > 1.20. DRY_RUN=True = solo pita y loguea.
+"""AUTOTRADER Rumor Burst: monitorea sentimiento (Square), entra en giros de BTC y sale solo.
+Estrategia: el MOVIMIENTO de BTC manda (no las etiquetas bull/bear).
+- Entradas: señal de comunidad + giro (bear->subiendo=LONG, bull->bajando=SHORT).
+- Salidas (espejo): LONG cierra si BTC baja, SHORT si BTC sube. En plana: HOLD.
+Sin bloqueos: ni stop diario ni balance mínimo frenan entradas (modo último intento).
+LIVE = dinero real. DRY_RUN (sin --live) = solo loguea.
 """
 import sys, json, time
 import winsound
@@ -14,6 +16,7 @@ NOTIONAL = 10.0
 MAX_POS = 3
 COOLDOWN_H = 6
 DAILY_STOP = -0.50
+BTC_MOM_DEADBAND_PCT = 0.10  # |cambio 60m| menor => PLANA (sin movimiento, no se opera)
 STATE = r"C:\Users\jhonv\Downloads\square-keyword-spike\autotrader_state.json"
 
 from unified import klines as _btc_klines  # solo régimen BTC para el árbitro (no dirección)
@@ -43,42 +46,106 @@ def state():
 def save_state(s):
     json.dump(s, open(STATE, "w"))
 
+def _pnl_of(p):
+    # /fapi/v2/account usa unrealizedProfit (minúscula), /fapi/v2/positionRisk usa unRealizedProfit
+    return float(p.get("unRealizedProfit", p.get("unrealizedProfit", 0)))
+
+def _mark_of(p, entry_fallback=0):
+    m = p.get("markPrice", 0)
+    try:
+        m = float(m)
+        if m > 0:
+            return m
+    except Exception:
+        pass
+    # fallback: precio ticker en vivo
+    try:
+        sym = p.get("symbol")
+        px = float(requests.get(BASE + "/fapi/v1/ticker/price", params={"symbol": sym}, timeout=10).json()["price"])
+        if px > 0:
+            return px
+    except Exception:
+        pass
+    return entry_fallback
+
 def positions():
     acct = signed("GET", "/fapi/v2/account")
+    if not isinstance(acct, dict) or "positions" not in acct:
+        log(f"positions() respuesta inesperada: {str(acct)[:200]}")
+        return 0.0, []
+    avail = float(acct.get("availableBalance", 0))
     pos = [p for p in acct.get("positions", []) if abs(float(p.get("positionAmt", 0))) > 0]
-    return float(acct.get("availableBalance", 0)), pos
+    # Enriquecer con /fapi/v2/positionRisk que SÍ trae markPrice + unRealizedProfit frescos.
+    # /fapi/v2/account no trae markPrice y usa unrealizedProfit (minúscula) -> por eso veías pnl=0.000.
+    try:
+        risk = signed("GET", "/fapi/v2/positionRisk")
+        if not isinstance(risk, list):
+            raise ValueError(f"positionRisk no lista: {str(risk)[:200]}")
+        by_key = {(r.get("symbol"), r.get("positionSide")): r for r in (risk or [])
+                  if isinstance(r, dict) and abs(float(r.get("positionAmt", 0))) > 0}
+        for p in pos:
+            r = by_key.get((p.get("symbol"), p.get("positionSide")))
+            if r:
+                if r.get("markPrice"):
+                    p["markPrice"] = r.get("markPrice")
+                if r.get("unRealizedProfit") is not None:
+                    p["unRealizedProfit"] = r.get("unRealizedProfit")
+                    p["unrealizedProfit"] = r.get("unRealizedProfit")
+    except Exception as e:
+        log(f"positionRisk merge falló ({e}), usando solo account.")
+    return avail, pos
 
 def close_market(sym, amt, pos_side):
     side = "SELL" if float(amt) > 0 else "BUY"
-    return signed("POST", "/fapi/v1/order", {"symbol": sym, "side": side, "type": "MARKET",
-                                             "quantity": abs(float(amt)), "positionSide": pos_side,
-                                             "reduceOnly": "true"})
+    qty = abs(float(amt))
+    base = {"symbol": sym, "side": side, "type": "MARKET",
+            "quantity": qty, "positionSide": pos_side}
+    r = signed("POST", "/fapi/v1/order", {**base, "reduceOnly": "true"})
+    # -1106: reduceOnly no requerido (ej. hedge/one-way) -> reintentar sin ese flag
+    if isinstance(r, dict) and r.get("code") == -1106:
+        log(f"close retry sin reduceOnly {sym}: {r}")
+        r = signed("POST", "/fapi/v1/order", base)
+    return r
 
 def run_once():
     st = state()
     today = time.strftime("%Y-%m-%d")
     if st.get("day") != today:
         st = {"traded": {}, "day": today, "day_pnl": 0.0}
-    if st["day_pnl"] <= DAILY_STOP:
-        log("stop diario alcanzado. No opera."); return st
+    daily_stop = st.get("day_pnl", 0) <= DAILY_STOP
+    if daily_stop:
+        log(f"stop diario alcanzado ({st.get('day_pnl', 0):.3f} <= {DAILY_STOP}): AVISO, entradas liberadas a pedido.")
 
     avail, pos = positions()
     log(f"balance disp={avail:.2f} abiertas={[p['symbol'] for p in pos]} modo={'LIVE' if not DRY_RUN else 'DRY'}")
     low_balance = avail < 1.20
     if low_balance:
-        log("balance mínimo: solo GESTIÓN, sin entradas nuevas.")
+        log(f"balance bajo ({avail:.2f} < 1.20): modo ÚLTIMO INTENTO (no bloquea).")
 
     res = top_rumor_discovery(spike_window_minutes=120, baseline_hours=12, max_pages=25,
                               top_n=12, min_total_mentions=3, with_price=True,
                               short_window_minutes=30, tradeable_only=True, exclude_noise=True)
     by_coin = {t["coin"]: t for t in res.get("top", [])}
-    # Régimen BTC actual para el árbitro (¿volteó contra la posición?)
+    # (S/R retirado: bloqueaba giros válidos en lateral estrecho.)
+    # Momento de precio BTC 60m (manda sobre etiquetas bull/bear):
+    # SUBIENDO / BAJANDO = hay movimiento, PLANA = quieto (no se opera).
+    _mom, _mom_chg = "PLANA", 0.0
     try:
-        from unified import klines as _kl
-        _bc = [float(k[4]) for k in _btc_klines("BTCUSDT", "15m", 17)]
-        btc_4h = round((_bc[-1] / _bc[0] - 1) * 100, 2) if _bc[0] else 0
-    except Exception:
-        btc_4h = 0.0
+        _mc = [float(k[4]) for k in _btc_klines("BTCUSDT", "15m", 6)]
+        if len(_mc) >= 5 and _mc[-5]:
+            _mom_chg = round((_mc[-1] / _mc[-5] - 1) * 100, 3)
+            _mom = "SUBIENDO" if _mom_chg > BTC_MOM_DEADBAND_PCT else ("BAJANDO" if _mom_chg < -BTC_MOM_DEADBAND_PCT else "PLANA")
+        log(f"BTC MOM 60m: {_mom_chg:+.3f}% -> {_mom}")
+    except Exception as e:
+        log(f"BTC MOM no disponible ({e}), se asume PLANA.")
+    # Giros (lo único que habilita entradas): bear->subiendo arma LONGs, bull->bajando arma SHORTs.
+    # La continuación ("entre bull" / "entre bear") se ignora: ahí ya se debió haber entrado.
+    _mom_prev = st.get("btc_mom_prev", _mom)
+    _upturn = (_mom_prev == "BAJANDO" and _mom == "SUBIENDO")
+    _downturn = (_mom_prev == "SUBIENDO" and _mom == "BAJANDO")
+    if _upturn or _downturn:
+        log(f"GIRO BTC: {_mom_prev} -> {_mom} ({'arma LONGs' if _upturn else 'arma SHORTs'})")
+    st["btc_mom_prev"] = _mom
     # Para monedas abiertas sin burst visible en el top: veredicto rápido individual
     # (el top solo trae min_total_mentions>=3; una moneda enfriándose desaparece del top)
     from server import coin_signal as _cs
@@ -112,77 +179,59 @@ def run_once():
         log(f"gauge BTC falló ({e}), sin veto direccional.")
         _btc_net = 0
 
-    # 1) GESTIONAR ABIERTAS. Dos salidas:
-    #    (a) CRUDA: el veto BTC se volteó contra la posición (sin requisito de profit).
-    #    (b) INTERÉS PERDIDO: aceleración muerta + profit cubriendo comisiones.
+    # 1) GESTIONAR ABIERTAS. SALIDA ÚNICA (a pedido del usuario):
+    #    Manda el MOVIMIENTO de BTC, no la etiqueta bull/bear:
+    #    LONG se cierra si BTC BAJA (aunque siga "bull"), SHORT si BTC SUBE.
+    #    En PLANA no hay movimiento => HOLD. Con profit o sin profit.
     qc = st.setdefault("quiet_cycles", {})
+    just_closed = set()
     for p in pos:
         sym = p["symbol"]; coin = sym.replace("USDT", "")
-        t = by_coin.get(coin, {})
         is_long = float(p["positionAmt"]) > 0
-        net = t.get("net_early", 0)
-        crowd = t.get("is_crowd_arriving", False)
-        early_m = t.get("early_mentions_proxy",
-                      t.get("early_mentions", t.get("early_mentions_30m", 1)))
-        pnl = float(p.get("unRealizedProfit", 0))
+        pnl = _pnl_of(p)
         reason = None
-        # SALIDA CRUDA: el veto BTC se volteó contra la posición (sin pedir profit)
-        if coin != "BTC":
-            if is_long and _btc_net <= -1:
-                reason = f"veto BTC volteado a bear (net={_btc_net}), tenías LONG"
-            elif not is_long and _btc_net >= 1:
-                reason = f"veto BTC volteado a bull (net={_btc_net}), tenías SHORT"
-        if reason is None and crowd:
-            reason = "multitud llegando (views)"
-        elif is_long and net <= -2:
-            reason = "sentimiento volteó a bear"
-        elif not is_long and net >= 2:
-            reason = "sentimiento volteó a bull"
-        else:
-            # ACELERACIÓN PERDIDA + PROFIT (1 ciclo, cubriendo comisiones) = cobrar ya
-            fees = abs(float(p.get("notional", 0))) * 0.0015
-            if early_m == 0 and pnl > fees:
-                reason = (f"aceleración perdida + profit (pnl={pnl:.3f} > fees~{fees:.3f})")
-            elif early_m == 0:
-                qc[coin] = qc.get(coin, 0) + 1
-            else:
-                qc[coin] = 0
-            # NIVEL 2 — ÁRBITRO IA: pérdida + posible volteo de régimen BTC o empate total
-            init_m = float(p.get("positionInitialMargin", 1)) or 1
-            roe = pnl / init_m * 100
-            regime_against = (is_long and btc_4h < -0.5) or (not is_long and btc_4h > 0.5)
-            if reason is None and roe < -10 and (regime_against or abs(net) <= 1):
-                try:
-                    from ai_arbiter import arbitrate
-                    brief = {
-                        "posicion": f"{sym} {p['positionSide']} entry={p.get('entryPrice')} mark={p.get('markPrice')}",
-                        "pnl": f"{pnl:.4f} USDT ({roe:.1f}% ROE)",
-                        "BTC_4h": f"{btc_4h}% (régimen {'EN CONTRA' if regime_against else 'neutral/a favor'})",
-                        "sentimiento_coin_30m": f"net={net} (bull-bear)",
-                        "menciones_tempranas": early_m,
-                        "pregunta": ("¿El mercado cambió de dirección (régimen BTC) invalidando la tesis, "
-                                     "o es ruido temporal para HOLD?")
-                    }
-                    arb = arbitrate(brief)
-                    log(f"ÁRBITRO IA {sym}: {arb['decision']} ({arb['reason']}) [{arb.get('model')}]")
-                    if arb["decision"] == "CLOSE":
-                        reason = f"árbitro IA: {arb['reason']}"
-                except Exception as e:
-                    log(f"árbitro {sym}: {e}")
+        if is_long and _mom == "BAJANDO":
+            reason = (f"BTC bajando ({_mom_chg:+.3f}%/60m, pnl={pnl:.3f})")
+        elif (not is_long) and _mom == "SUBIENDO":
+            reason = (f"BTC subiendo ({_mom_chg:+.3f}%/60m, pnl={pnl:.3f})")
         if reason:
-            # SOLO ALERTA: el bot NUNCA cierra posiciones (TP/SL del exchange protegen).
-            # Las entradas automáticas se mantienen; las salidas son manuales del usuario.
-            pnl = float(p.get("unRealizedProfit", 0))
-            log(f"*** ALERTA SALIDA {sym} pnl={pnl:.3f} ({reason}) — cerrar MANUAL ***")
-            beep("exit_win" if pnl >= 0 else "exit_loss")
+            # CIERRE REAL: en LIVE se cierra por MARKET + se cancelan TP/SL restantes.
+            pnl = _pnl_of(p)
+            if DRY_RUN:
+                log(f"*** SEÑAL SALIDA {sym} pnl={pnl:.3f} ({reason}) — dry-run, no se cierra ***")
+            else:
+                try:
+                    amt = p.get("positionAmt")
+                    ps = p.get("positionSide", "BOTH")
+                    r = close_market(sym, amt, ps)
+                    if isinstance(r, dict) and "orderId" in r:
+                        log(f"CERRADA {sym} {ps} amt={amt} pnl~{pnl:.3f} ({reason}) orderId={r['orderId']}")
+                        try:
+                            signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": sym})
+                        except Exception as e2:
+                            log(f"cancel openOrders {sym}: {e2}")
+                        st["day_pnl"] = float(st.get("day_pnl", 0)) + float(pnl)
+                        st.get("open_ctx", {}).pop(sym, None)
+                        qc.pop(coin, None)
+                        st.setdefault("closed_syms", {})[sym] = time.time()
+                        just_closed.add(sym)
+                        beep("exit_win" if pnl >= 0 else "exit_loss")
+                    else:
+                        log(f"ERROR cierre {sym}: {r} — cerrar MANUAL")
+                        beep("exit_loss")
+                except Exception as e:
+                    log(f"ERROR cierre {sym}: {e} — cerrar MANUAL")
 
     # ESTADO de abiertas (cada ciclo, para decidir salida a ojo):
     # mark, PnL/ROE, % al TP y al SL, sentimiento 30m, ciclos callados, edad
     for p in pos:
         try:
             sym = p["symbol"]; coin = sym.replace("USDT", "")
-            entry_c = float(p.get("entryPrice", 0)); mark_c = float(p.get("markPrice", entry_c))
-            pnl_c = float(p.get("unRealizedProfit", 0))
+            if sym in just_closed:
+                log(f"ESTADO {sym} recién CERRADA este ciclo, omitiendo.")
+                continue
+            entry_c = float(p.get("entryPrice", 0)); mark_c = _mark_of(p, entry_c)
+            pnl_c = _pnl_of(p)
             init_c = float(p.get("positionInitialMargin", 0)) or 1
             t = by_coin.get(coin, {})
             ctx = st.get("open_ctx", {}).get(sym, {})
@@ -204,39 +253,63 @@ def run_once():
     # 2) ENTRAR: solo si hay campo Y balance suficiente
     _, pos = positions() if not DRY_RUN else (avail, pos)
     held_syms = {p["symbol"] for p in pos}
-    if low_balance:
-        log("sin entradas por balance mínimo."); return st
+    # MODO ÚLTIMO INTENTO (a pedido): sin bloqueo por balance mínimo.
+    # Con poco saldo se usa el nocional mínimo del exchange y el máximo apalancamiento.
+    last_try = low_balance
+    if last_try:
+        log(f"balance mínimo ({avail:.2f}): ÚLTIMO INTENTO, nocional mínimo + apalancamiento máximo.")
     if len(pos) >= MAX_POS:
         log("sin campo."); return st
-    # Veto direccional con el gauge ya calculado arriba (vale para entradas y salida cruda).
-    _ban_alt_short = _btc_net >= 1
-    _ban_alt_long = _btc_net <= -1
-    if _ban_alt_short:
-        log(f"BTC long en comunidad (net={_btc_net}): prohibido SHORT en alts.")
-    if _ban_alt_long:
-        log(f"BTC bear en comunidad (net={_btc_net}): prohibido LONG en alts.")
-    for t in res.get("top", []):
+    # NOTA: sin veto direccional del gauge. El giro de precio manda: un SHORT en
+    # bull-bajando (sobreextendido cayendo) es justo el mejor trade, y el veto lo
+    # habría prohibido. El gauge queda solo informativo en el log.
+    # Candidatas: señales de comunidad ordenadas por movimiento más pronunciado
+    # (|chg_24h| desc) + SOL predeterminada: si hay giro BTC y SOL no trae señal,
+    # se opera SOL igual con la dirección del giro (todas siguen a BTC).
+    _cands = [t for t in res.get("top", [])
+              if t.get("directive") in ("ENTER_EARLY_LONG", "ENTER_EARLY_SHORT")]
+    _cands.sort(key=lambda t: abs(t.get("chg_24h") or 0), reverse=True)
+    if not any(t.get("coin") == "SOL" for t in _cands):
+        _sol_chg = by_coin.get("SOL", {}).get("chg_24h")
+        if _upturn:
+            _cands.insert(0, {"coin": "SOL", "directive": "ENTER_EARLY_LONG",
+                              "directive_reason": "default SOL: giro BTC bear->subiendo, sin noticias",
+                              "chg_24h": _sol_chg})
+        elif _downturn:
+            _cands.insert(0, {"coin": "SOL", "directive": "ENTER_EARLY_SHORT",
+                              "directive_reason": "default SOL: giro BTC bull->bajando, sin noticias",
+                              "chg_24h": _sol_chg})
+    for t in _cands:
         d = t.get("directive", "WAIT")
         if d not in ("ENTER_EARLY_LONG", "ENTER_EARLY_SHORT"):
             continue
         coin = t["coin"]; sym = f"{coin}USDT"
-        _is_short = d == "ENTER_EARLY_SHORT"
-        if coin != "BTC" and ((_is_short and _ban_alt_short) or (not _is_short and _ban_alt_long)):
-            log(f"{coin}: skipeada por veto BTC ({d} contra BTC)."); continue
         if sym in held_syms:
             log(f"{coin}: ya abierta, no duplicar."); continue
         # Sin cooldown: si hay señal nueva, se entra (el usuario lo pidió).
         # confirmación técnica rápida (sin scan completo): flow + book alineados
         side = "LONG" if d == "ENTER_EARLY_LONG" else "SHORT"
+        # Filtro momento BTC: LONG solo SUBIENDO, SHORT solo BAJANDO, en PLANA no se entra
+        if side == "LONG" and _mom != "SUBIENDO":
+            log(f"{coin}: LONG skipeado, BTC {_mom} ({_mom_chg:+.3f}%/60m)."); continue
+        if side == "SHORT" and _mom != "BAJANDO":
+            log(f"{coin}: SHORT skipeado, BTC {_mom} ({_mom_chg:+.3f}%/60m)."); continue
+        # Filtro giro: solo se entra en el giro (bear->subiendo LONG, bull->bajando SHORT).
+        # La continuación se ignora: ahí ya se debió haber entrado.
+        if side == "LONG" and not _upturn:
+            log(f"{coin}: LONG skipeado, sin giro alcista (prev={_mom_prev})."); continue
+        if side == "SHORT" and not _downturn:
+            log(f"{coin}: SHORT skipeado, sin giro bajista (prev={_mom_prev})."); continue
         # Dirección SOLO por comunidad (directiva). Flow/book retirados del path:
         # comprobado que definir dirección con datos es arriesgado y bloquea entradas buenas.
         px = float(requests.get(BASE + "/fapi/v1/ticker/price", params={"symbol": sym}, timeout=10).json()["price"])
         _, step, minqty, minnot = filters(sym)
         import math as _m
-        raw = max(NOTIONAL, minnot or 5.0) / px
+        _target = (minnot or 5.0) if last_try else max(NOTIONAL, minnot or 5.0)
+        raw = _target / px
         qty = _m.floor(raw / step) * step if step else raw
         if qty * px < (minnot or 5.0):
-            qty = round(qty + (step or 0), 8)  # subir un step para cumplir mínimo
+            qty = rnd_step(qty + (step or 0), step)  # subir un step, alineado al step (evita -1111)
         if qty <= 0 or qty < (minqty or 0) or qty * px < (minnot or 5.0):
             log(f"{coin}: sin tamaño para la cuenta (qty={qty} notional={qty*px:.2f} mín={minnot}). Skip al siguiente.")
             continue
@@ -244,11 +317,18 @@ def run_once():
         maxlev = max_leverage(sym)
         need = qty * px
         import math as _m2
-        lev = _m2.ceil(need / max(avail, 0.01) * 1.5)  # margen con colchón 50%
-        lev = max(1, min(lev, maxlev))
-        if need / lev * 1.2 > avail:
-            log(f"{coin}: sin margen con colchón (necesita {need/lev*1.2:.2f}, hay {avail:.2f}). Skip.")
-            continue
+        if last_try:
+            lev = maxlev  # todo lo que dé el exchange
+            if need / lev > avail:
+                log(f"{coin}: sin margen ni al máximo (necesita {need/lev:.2f}, hay {avail:.2f}). Skip.")
+                continue
+            log(f"{coin}: ÚLTIMO INTENTO {lev}x notional={need:.2f} con disp={avail:.2f}.")
+        else:
+            lev = _m2.ceil(need / max(avail, 0.01) * 1.5)  # margen con colchón 50%
+            lev = max(1, min(lev, maxlev))
+            if need / lev * 1.2 > avail:
+                log(f"{coin}: sin margen con colchón (necesita {need/lev*1.2:.2f}, hay {avail:.2f}). Skip.")
+                continue
         if lev > 10:
             log(f"{coin}: AVISO apalancamiento {lev}x (máx {maxlev}x) para que quepa el mínimo.")
         log(f"ENTRADA {sym} {side} qty={qty} @{px} ({t.get('directive_reason')})")
