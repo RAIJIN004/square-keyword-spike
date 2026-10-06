@@ -22,7 +22,10 @@ MOM_TRAIL_PCT = 0.020  # trailing: retroceso del momentum que cierra la posició
 MOM_FILTER_ON = False  # momento-precio no filtra (manda el gauge fade); se deja el MOM en el log
 ADD_LOSS_ROE_PCT = 10.0  # agregar a abierta solo si va perdiendo >= X% ROE
 MAX_ADDS = 2  # máximo de agregados por posición (lado)
-TP_LADDER_ROE = [50.0, 150.0, 300.0, 500.0]  # escalera: un TP activo; al llenarse, el siguiente más lejos
+TP_LADDER_ROE = [50.0, 150.0, 300.0, 500.0]  # (retirada: la reemplaza el TP clave único)
+TP_WALL_X = 3.0  # muro = acumulado >= 3x el nocional propio
+TP_FEE_FLOOR_PCT = 0.30  # profit mínimo realista sobre comisiones (% precio)
+TP_MAX_PCT = 3.0  # tope: más lejos es irreal intradía => fallback ROE +150%
 SOL_AUTO = True  # moneda automática: sin su señal, solo con la dirección de BTC
 DEFAULT_COIN = "HYPE"  # moneda default para el modo auto (antes SOL)
 STATE = r"C:\Users\jhonv\Downloads\square-keyword-spike\autotrader_state.json"
@@ -110,18 +113,58 @@ def positions():
         log(f"positionRisk merge falló ({e}), usando solo account.")
     return avail, pos
 
-def cancel_side_orders(sym, side):
-    # Cancela solo las órdenes (TP/SL) del lado cerrado, sin tocar el hedge contrario.
+def key_tp_price(sym, side, entry_px, notional, lev, tick):
+    """TP CLAVE único: primer obstáculo entre muro del orderbook (acum >= 3x,
+    a >=0.30%) y swing 24h. LONG = min(muro ASK, máximo); SHORT = max(muro BID, mínimo).
+    Si queda más allá de 3% o no hay datos: fallback ROE +150% por leverage."""
     try:
-        oo = signed("GET", "/fapi/v1/openOrders", {"symbol": sym})
-        for o in (oo or []):
-            if isinstance(o, dict) and o.get("positionSide") == side and o.get("orderId"):
-                try:
-                    signed("DELETE", "/fapi/v1/order", {"symbol": sym, "orderId": o["orderId"]})
-                except Exception as e2:
-                    log(f"cancel orden {o.get('orderId')} {sym}/{side}: {e2}")
+        ob = requests.get(BASE + "/fapi/v1/depth",
+                           params={"symbol": sym, "limit": 1000}, timeout=15).json()
+        bids = [(float(p), float(q)) for p, q in ob.get("bids", [])]
+        asks = [(float(p), float(q)) for p, q in ob.get("asks", [])]
+        ks = requests.get(BASE + "/fapi/v1/klines",
+                          params={"symbol": sym, "interval": "15m", "limit": 96}, timeout=15).json()
+        hi = max(float(k[2]) for k in ks)
+        lo = min(float(k[3]) for k in ks)
     except Exception as e:
-        log(f"listar openOrders {sym}: {e}")
+        log(f"TP clave {sym}: sin book ({e}), fallback ROE.")
+        ob = None
+    _sgn = 1 if side == "LONG" else -1
+    fb = entry_px * (1 + _sgn * 1.5 / max(lev, 1))
+    if not ob:
+        return round(fb, _step_dec(tick) if tick else 8), "fallback-ROE"
+    acc, wall = 0.0, None
+    levels = asks if side == "LONG" else bids
+    for p, q in levels:
+        acc += p * q
+        d = (p - entry_px) / entry_px * 100 * _sgn
+        if acc >= notional * TP_WALL_X and d >= TP_FEE_FLOOR_PCT:
+            wall = p
+            break
+    ref = (min(wall, hi) if wall else hi) if side == "LONG" else (max(wall, lo) if wall else lo)
+    dref = (ref - entry_px) / entry_px * 100 * _sgn
+    if dref > TP_MAX_PCT or dref < TP_FEE_FLOOR_PCT:
+        return round(fb, _step_dec(tick) if tick else 8), "fallback-ROE"
+    return round(ref, _step_dec(tick) if tick else 8), f"muro+swing({dref:.2f}%)"
+
+def cancel_side_orders(sym, side):
+    # Cancela solo las ALGO-órdenes (TP/SL) del lado cerrado, sin tocar el hedge contrario.
+    try:
+        oo = signed("GET", "/fapi/v1/openAlgoOrders", {"symbol": sym})
+        if isinstance(oo, dict):
+            oo = oo.get("orders", oo.get("data", []))
+        for o in (oo or []):
+            if not isinstance(o, dict):
+                continue
+            _ps = o.get("positionSide", side)
+            _id = o.get("algoId")
+            if _id and (_ps == side or "positionSide" not in o):
+                try:
+                    signed("DELETE", "/fapi/v1/algoOrder", {"symbol": sym, "algoId": _id})
+                except Exception as e2:
+                    log(f"cancel algo {_id} {sym}/{side}: {e2}")
+    except Exception as e:
+        log(f"listar openAlgoOrders {sym}: {e}")
 
 def close_market(sym, amt, pos_side):
     side = "SELL" if float(amt) > 0 else "BUY"
@@ -146,6 +189,37 @@ def run_once():
 
     avail, pos = positions()
     log(f"balance disp={avail:.2f} abiertas={[p['symbol'] for p in pos]} modo={'LIVE' if not DRY_RUN else 'DRY'}")
+    # Higiene anti-TP-huérfano (a pedido): un TP de una posición ya cerrada (por TP,
+    # liquidación o cierre manual) puede dispararse sobre una posición NUEVA del mismo
+    # lado y cerrarla a un nivel viejo. Símbolos cerrados sin posición => cancelar sus algos.
+    try:
+        _now = time.time()
+        for _csym in list(st.get("closed_syms", {})):
+            try:
+                _ts = float(st["closed_syms"].get(_csym, 0))
+            except Exception:
+                _ts = 0.0
+            if any(p["symbol"] == _csym for p in pos):
+                continue
+            if _now - _ts > 86400:
+                st["closed_syms"].pop(_csym, None)
+                continue
+            try:
+                _oo = signed("GET", "/fapi/v1/openAlgoOrders", {"symbol": _csym})
+                if isinstance(_oo, dict):
+                    _oo = _oo.get("orders", _oo.get("data", []))
+                _n = 0
+                for _o in (_oo or []):
+                    if isinstance(_o, dict) and _o.get("algoId"):
+                        signed("DELETE", "/fapi/v1/algoOrder", {"symbol": _csym, "algoId": _o["algoId"]})
+                        _n += 1
+                if _n:
+                    log(f"TP huérfano cancelado x{_n} en {_csym} (sin posición).")
+                st["closed_syms"].pop(_csym, None)
+            except Exception as e:
+                log(f"higiene algos {_csym}: {e}")
+    except Exception as e:
+        log(f"higiene huérfanos: {e}")
     low_balance = avail < 1.20
     if low_balance:
         log(f"balance bajo ({avail:.2f} < 1.20): modo ÚLTIMO INTENTO (no bloquea).")
@@ -283,37 +357,7 @@ def run_once():
                 reason = (f"plano-bajista drenando LONG (pnl={pnl:.3f})")
             elif (not is_long) and _gdir == "PLANA" and _gtrend == "subiendo":
                 reason = (f"plano-alcista drenando SHORT (pnl={pnl:.3f})")
-        # Escalera TP bot-side (a pedido): al tocar cada peldaño ROE se cierra 50%
-        # por MARKET (reduceOnly, exento de mínimo). Un peldaño por ciclo.
-        # Sin órdenes TP en el exchange (el mínimo $50 impediría partir).
-        if reason is None and not DRY_RUN:
-            _ck = st.setdefault("open_ctx", {}).get(_tk, {})
-            _tier = _ck.get("tp_tier", 0)
-            _i2 = float(p.get("positionInitialMargin", 0)) or 1
-            _r2 = pnl / _i2 * 100
-            while _tier < len(TP_LADDER_ROE) and _r2 >= TP_LADDER_ROE[_tier]:
-                _amt = abs(float(p.get("positionAmt", 0)))
-                try:
-                    _, _st2, _, _ = filters(sym)
-                    _d2 = _step_dec(_st2) if _st2 else 8
-                except Exception:
-                    _d2 = 8
-                _qc = round(_amt / 2, _d2)
-                if _qc <= 0 or _amt - _qc <= 0:
-                    reason = (f"TP escalera final +{TP_LADDER_ROE[_tier]:.0f}% ROE (pnl={pnl:.3f})")
-                    break
-                _qcs = _qc if float(p.get("positionAmt", 0)) > 0 else -_qc
-                _rc = close_market(sym, _qcs, p.get("positionSide", "BOTH"))
-                if isinstance(_rc, dict) and "orderId" in _rc:
-                    _frac = _qc / _amt if _amt else 1.0
-                    st["day_pnl"] = float(st.get("day_pnl", 0)) + float(pnl) * _frac
-                    _tier += 1
-                    _ck["tp_tier"] = _tier
-                    log(f"TP PARCIAL {sym} peldaño {_tier}/{len(TP_LADDER_ROE)} (+{TP_LADDER_ROE[_tier-1]:.0f}% ROE) x{_qc} orderId={_rc['orderId']}")
-                    beep("exit_win")
-                    break
-                log(f"ERROR TP parcial {sym}: {_rc}")
-                break
+        # (Escalera bot-side retirada: la reemplaza el TP clave único en exchange.)
         if reason:
             # CIERRE REAL: en LIVE se cierra por MARKET + se cancelan TP/SL restantes.
             pnl = _pnl_of(p)
@@ -373,6 +417,15 @@ def run_once():
     _, pos = positions() if not DRY_RUN else (avail, pos)
     held = {(p["symbol"], p.get("positionSide", "BOTH")): p for p in pos}
     held_syms = set(held.keys())
+    # Limpieza: si un TP del exchange cerró solo, el bot no lo vio; purgar ctx/trail
+    # huérfanos para no bloquear agregados ni disparar locks viejos.
+    for _k in list(st.get("open_ctx", {})):
+        if _k not in held_syms:
+            st["open_ctx"].pop(_k, None)
+            st.setdefault("closed_syms", {})[_k.split(":")[0]] = time.time()
+    for _k in list(st.get("mom_trail", {})):
+        if _k not in held_syms:
+            st["mom_trail"].pop(_k, None)
     # MODO ÚLTIMO INTENTO (a pedido): sin bloqueo por balance mínimo.
     # Con poco saldo se usa el nocional mínimo del exchange y el máximo apalancamiento.
     last_try = low_balance
@@ -496,9 +549,19 @@ def run_once():
                                                   "quantity": qty, "positionSide": side})
             if "orderId" not in o:
                 log(f"ERROR entrada: {o}"); return st
-            # Sin TP/SL en el exchange (a pedido): la escalera TP bot-side toma parciales
-            # por MARKET al tocar cada peldaño; el mínimo $50 impediría partir en exchange.
-            log(f"ABIERTA {sym} {side} qty={qty} @{px} escalera={TP_LADDER_ROE} (sin SL)")
+            # TP CLAVE por entrada vía ALGO API (los condicionales no van por /order: -4120).
+            # Cada inyección lleva su propio TP del tamaño de esa entrada en su zona clave.
+            # SIN reduceOnly explícito (da -1106); el servidor lo pone.
+            cs = "SELL" if side == "LONG" else "BUY"
+            _tp_price, _tp_why = key_tp_price(sym, side, px, qty * px, lev, tick)
+            _tp = signed("POST", "/fapi/v1/algoOrder", {"algoType": "CONDITIONAL", "symbol": sym,
+                                                        "side": cs, "positionSide": side,
+                                                        "type": "TAKE_PROFIT_MARKET",
+                                                        "triggerPrice": _tp_price, "quantity": qty,
+                                                        "timeInForce": "GTC"})
+            _tp_id = _tp.get("algoId") if isinstance(_tp, dict) else None
+            log(f"TP clave {sym} {side} x{qty} @{_tp_price} ({_tp_why}): {'ok #' + str(_tp_id) if _tp_id else _tp}")
+            log(f"ABIERTA {sym} {side} qty={qty} @{px} (sin SL)")
             st["traded"][coin] = time.time()
             _oct = st.setdefault("open_ctx", {}).get(_key, {})
             _pa = abs(float(held.get(_key, {}).get("positionAmt", 0)))
@@ -507,7 +570,8 @@ def run_once():
             _avg = (_pa * _pe + qty * px) / _tt if _tt else px
             st.setdefault("open_ctx", {})[_key] = {"entry": _avg, "tp_tier": _oct.get("tp_tier", 0),
                                                   "side": side, "t0": _oct.get("t0", time.time()),
-                                                  "adds": _oct.get("adds", 0) + (1 if _pa else 0)}
+                                                  "adds": _oct.get("adds", 0) + (1 if _pa else 0),
+                                                  "tps": _oct.get("tps", []) + ([{"qty": qty, "price": _tp_price, "id": _tp_id}] if _tp_id else [])}
             st.setdefault("mom_trail", {})[_key] = {"peak": _mom_chg, "trough": _mom_chg, "locked": False}
             held_syms.add(_key)  # no duplicar dentro del mismo ciclo
         else:
